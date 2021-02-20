@@ -40,6 +40,9 @@
 #include "src/watchlist.h"
 #include "src/scan.h"
 #include "src/netdev.h"
+#ifdef HAVE_DBUS
+#include "src/dbus.h"
+#endif
 #include "src/wiphy.h"
 #include "src/network.h"
 #include "src/knownnetworks.h"
@@ -57,6 +60,7 @@ static struct l_queue *station_list;
 static uint32_t netdev_watch;
 static uint32_t mfp_setting;
 static bool anqp_disabled;
+static bool netconfig_enabled;
 
 struct station {
 	enum station_state state;
@@ -149,6 +153,12 @@ static void station_property_set_scanning(struct station *station,
 		return;
 
 	station->scanning = scanning;
+
+#ifdef HAVE_DBUS
+	l_dbus_property_changed(dbus_get_bus(),
+				netdev_get_path(station->netdev),
+					IWD_STATION_INTERFACE, "Scanning");
+#endif
 }
 
 static void station_enter_state(struct station *station,
@@ -215,6 +225,17 @@ static void bss_free(void *data)
 
 	scan_bss_free(bss);
 }
+
+#ifdef HAVE_CONFIG_H
+#ifdef HAVE_DBUS
+static void network_free(void *data)
+{
+	struct network *network = data;
+
+	network_remove(network, -ESHUTDOWN);
+}
+#endif
+#endif
 
 static bool process_network(const void *key, void *data, void *user_data)
 {
@@ -688,7 +709,7 @@ static void station_handshake_event(struct handshake_state *hs,
 	case HANDSHAKE_EVENT_SETTING_KEYS_FAILED:
 	case HANDSHAKE_EVENT_EAP_NOTIFY:
 		/*
-		 * currently we dont care about any other events. The
+		 * currently we don't care about any other events. The
 		 * netdev_connect_cb will notify us when the connection is
 		 * complete.
 		 */
@@ -885,6 +906,10 @@ static struct handshake_state *station_handshake_setup(struct station *station,
 	struct handshake_state *hs;
 	const char *ssid;
 	uint32_t eapol_proto_version;
+	const char *value;
+	bool full_random;
+	bool override = false;
+	uint8_t new_addr[ETH_ALEN];
 
 	hs = netdev_handshake_state_new(station->netdev);
 
@@ -943,6 +968,42 @@ static struct handshake_state *station_handshake_setup(struct station *station,
 				IE_RSN_AKM_SUITE_FT_OVER_FILS_SHA256 |
 				IE_RSN_AKM_SUITE_FT_OVER_FILS_SHA384))
 		hs->erp_cache = erp_cache_get(network_get_ssid(network));
+
+	/*
+	 * We have three possible options here:
+	 * 1. per-network MAC generation (default, no option in network config)
+	 * 2. per-network full MAC randomization
+	 * 3. per-network MAC override
+	 */
+
+	if (!l_settings_get_bool(settings, "Settings",
+					"AlwaysRandomizeAddress",
+					&full_random))
+		full_random = false;
+
+	value = l_settings_get_value(settings, "Settings",
+					"AddressOverride");
+	if (value) {
+		if (util_string_to_address(value, new_addr) &&
+					util_is_valid_sta_address(new_addr))
+			override = true;
+		else
+			l_warn("[Network].AddressOverride is not a valid "
+				"MAC address");
+	}
+
+	if (override && full_random) {
+		l_warn("Cannot use both AlwaysRandomizeAddress and "
+			"AddressOverride concurrently, defaulting to override");
+		full_random = false;
+	}
+
+	if (override)
+		handshake_state_set_supplicant_address(hs, new_addr);
+	else if (full_random) {
+		wiphy_generate_random_address(wiphy, new_addr);
+		handshake_state_set_supplicant_address(hs, new_addr);
+	}
 
 	return hs;
 
@@ -1124,10 +1185,23 @@ static void station_enter_state(struct station *station,
 						enum station_state state)
 {
 	uint64_t id = netdev_get_wdev_id(station->netdev);
+#ifdef HAVE_DBUS
+	struct l_dbus *dbus = dbus_get_bus();
+	bool disconnected;
+#endif
 
 	l_debug("Old State: %s, new state: %s",
 			station_state_to_string(station->state),
 			station_state_to_string(state));
+
+#ifdef HAVE_DBUS
+	disconnected = !station_is_busy(station);
+
+	if ((disconnected && state > STATION_STATE_AUTOCONNECT_FULL) ||
+			(!disconnected && state != station->state))
+		l_dbus_property_changed(dbus, netdev_get_path(station->netdev),
+					IWD_STATION_INTERFACE, "State");
+#endif
 
 	switch (state) {
 	case STATION_STATE_AUTOCONNECT_QUICK:
@@ -1138,6 +1212,13 @@ static void station_enter_state(struct station *station,
 					new_scan_results, station);
 		break;
 	case STATION_STATE_CONNECTING:
+#ifdef HAVE_DBUS
+		l_dbus_property_changed(dbus, netdev_get_path(station->netdev),
+				IWD_STATION_INTERFACE, "ConnectedNetwork");
+		l_dbus_property_changed(dbus,
+				network_get_path(station->connected_network),
+				IWD_NETWORK_INTERFACE, "Connected");
+#endif
 		/* fall through */
 	case STATION_STATE_DISCONNECTED:
 	case STATION_STATE_CONNECTED:
@@ -1205,6 +1286,9 @@ static void station_roam_state_clear(struct station *station)
 static void station_reset_connection_state(struct station *station)
 {
 	struct network *network = station->connected_network;
+#ifdef HAVE_DBUS
+	struct l_dbus *dbus = dbus_get_bus();
+#endif
 
 	if (!network)
 		return;
@@ -1218,6 +1302,13 @@ static void station_reset_connection_state(struct station *station)
 
 	station->connected_bss = NULL;
 	station->connected_network = NULL;
+
+#ifdef HAVE_DBUS
+	l_dbus_property_changed(dbus, netdev_get_path(station->netdev),
+				IWD_STATION_INTERFACE, "ConnectedNetwork");
+	l_dbus_property_changed(dbus, network_get_path(network),
+				IWD_NETWORK_INTERFACE, "Connected");
+#endif
 }
 
 static void station_disassociated(struct station *station)
@@ -2057,7 +2148,7 @@ void station_ap_directed_roam(struct station *station,
 
 
 	if (req_mode & WNM_REQUEST_MODE_PREFERRED_CANDIDATE_LIST) {
-		l_debug("roam: AP sent a preffered candidate list");
+		l_debug("roam: AP sent a preferred candidate list");
 		station_neighbor_report_cb(station->netdev, 0, body + pos,
 				body_len - pos,station);
 	} else {
@@ -2124,7 +2215,7 @@ static void station_netdev_event(struct netdev *netdev, enum netdev_event event,
 	case NETDEV_EVENT_RSSI_LEVEL_NOTIFY:
 		station_rssi_level_changed(station, l_get_u8(event_data));
 		break;
-	};
+	}
 }
 
 static bool station_try_next_bss(struct station *station)
@@ -2151,7 +2242,7 @@ static bool station_retry_with_reason(struct station *station,
 					uint16_t reason_code)
 {
 	/*
-	 * We dont want to cause a retry and blacklist if the password was
+	 * We don't want to cause a retry and blacklist if the password was
 	 * incorrect. Otherwise we would just continue to fail.
 	 *
 	 * Other reason codes can be added here if its decided we want to
@@ -2195,6 +2286,29 @@ static bool station_retry_with_status(struct station *station,
 	return station_try_next_bss(station);
 }
 
+#ifdef HAVE_DBUS
+static void station_connect_dbus_reply(struct station *station,
+					enum netdev_result result)
+{
+	struct l_dbus_message *reply;
+
+	switch (result) {
+	case NETDEV_RESULT_ABORTED:
+		reply = dbus_error_aborted(station->connect_pending);
+		break;
+	case NETDEV_RESULT_OK:
+		reply = l_dbus_message_new_method_return(
+					station->connect_pending);
+		break;
+	default:
+		reply = dbus_error_failed(station->connect_pending);
+		break;
+	}
+
+	dbus_pending_reply(&station->connect_pending, reply);
+}
+#endif
+
 static void station_connect_cb(struct netdev *netdev, enum netdev_result result,
 					void *event_data, void *user_data)
 {
@@ -2222,6 +2336,11 @@ static void station_connect_cb(struct netdev *netdev, enum netdev_result result,
 	default:
 		break;
 	}
+
+#ifdef HAVE_DBUS
+	if (station->connect_pending)
+		station_connect_dbus_reply(station, result);
+#endif
 
 	if (result != NETDEV_RESULT_OK) {
 		if (result != NETDEV_RESULT_ABORTED) {
@@ -2273,6 +2392,7 @@ int __station_connect_network(struct station *station, struct network *network,
 	return 0;
 }
 
+#ifdef HAVE_DBUS
 static void station_disconnect_onconnect_cb(struct netdev *netdev, bool success,
 					void *user_data)
 {
@@ -2294,15 +2414,18 @@ static void station_disconnect_onconnect_cb(struct netdev *netdev, bool success,
 
 	station_enter_state(station, STATION_STATE_CONNECTING);
 }
+#endif
 
 static void station_disconnect_onconnect(struct station *station,
 					struct network *network,
 					struct scan_bss *bss)
 {
+#ifdef HAVE_DBUS
 	if (netdev_disconnect(station->netdev, station_disconnect_onconnect_cb,
 								station) < 0) {
 		return;
 	}
+#endif
 
 	if (station->netconfig)
 		netconfig_reset(station->netconfig);
@@ -2314,12 +2437,17 @@ static void station_disconnect_onconnect(struct station *station,
 	station->connect_pending_network = network;
 	station->connect_pending_bss = bss;
 
-	station->connect_pending = true;
+#ifdef HAVE_DBUS
+	station->connect_pending = l_dbus_message_ref(message);
+#endif
 }
 
 void station_connect_network(struct station *station, struct network *network,
 				struct scan_bss *bss)
 {
+#ifdef HAVE_DBUS
+	struct l_dbus *dbus = dbus_get_bus();
+#endif
 	int err;
 
 	if (station_is_busy(station)) {
@@ -2334,14 +2462,156 @@ void station_connect_network(struct station *station, struct network *network,
 
 	station_enter_state(station, STATION_STATE_CONNECTING);
 
-	station->connect_pending = true;
+#ifdef HAVE_DBUS
+	station->connect_pending = l_dbus_message_ref(message);
+#endif
 	station->autoconnect = true;
 
 	return;
 
 error:
+#ifdef HAVE_DBUS
+	l_dbus_send(dbus, dbus_error_from_errno(err, message));
+#else
     return;
+#endif
 }
+
+#ifdef HAVE_DBUS
+static void station_hidden_network_scan_triggered(int err, void *user_data)
+{
+	struct station *station = user_data;
+
+	l_debug("");
+
+	if (!err)
+		return;
+
+	dbus_pending_reply(&station->connect_pending,
+				dbus_error_failed(station->connect_pending));
+}
+
+static bool station_hidden_network_scan_results(int err,
+						struct l_queue *bss_list,
+						void *userdata)
+{
+	struct station *station = userdata;
+	struct network *network_psk;
+	struct network *network_open;
+	struct network *network;
+	const char *ssid;
+	uint8_t ssid_len;
+	struct l_dbus_message *msg;
+	struct scan_bss *bss;
+
+	l_debug("");
+
+	msg = station->connect_pending;
+	station->connect_pending = NULL;
+
+	if (err) {
+		dbus_pending_reply(&msg, dbus_error_failed(msg));
+		return false;
+	}
+
+	if (!l_dbus_message_get_arguments(msg, "s", &ssid)) {
+		dbus_pending_reply(&msg, dbus_error_invalid_args(msg));
+		return false;
+	}
+
+	ssid_len = strlen(ssid);
+
+	while ((bss = l_queue_pop_head(bss_list))) {
+		if (bss->ssid_len != ssid_len ||
+					memcmp(bss->ssid, ssid, ssid_len))
+			goto next;
+
+		if (station_add_seen_bss(station, bss)) {
+			l_queue_push_tail(station->bss_list, bss);
+
+			continue;
+		}
+
+next:
+		scan_bss_free(bss);
+	}
+
+	l_queue_destroy(bss_list, NULL);
+
+	network_psk = station_network_find(station, ssid, SECURITY_PSK);
+	network_open = station_network_find(station, ssid, SECURITY_NONE);
+
+	if (!network_psk && !network_open) {
+		dbus_pending_reply(&msg, dbus_error_not_found(msg));
+		return true;
+	}
+
+	if (network_psk && network_open) {
+		dbus_pending_reply(&msg, dbus_error_service_set_overlap(msg));
+		return true;
+	}
+
+	network = network_psk ? : network_open;
+
+	network_connect_new_hidden_network(network, msg);
+	l_dbus_message_unref(msg);
+
+	return true;
+}
+
+static void station_hidden_network_scan_destroy(void *userdata)
+{
+	struct station *station = userdata;
+
+	station->hidden_network_scan_id = 0;
+}
+
+static struct l_dbus_message *station_dbus_connect_hidden_network(
+						struct l_dbus *dbus,
+						struct l_dbus_message *message,
+						void *user_data)
+{
+	struct station *station = user_data;
+	uint64_t id = netdev_get_wdev_id(station->netdev);
+	struct scan_parameters params = {
+		.flush = true,
+		.randomize_mac_addr_hint = true,
+	};
+	const char *ssid;
+
+	l_debug("");
+
+	if (station->connect_pending || station_is_busy(station))
+		return dbus_error_busy(message);
+
+	if (!l_dbus_message_get_arguments(message, "s", &ssid))
+		return dbus_error_invalid_args(message);
+
+	if (strlen(ssid) > 32)
+		return dbus_error_invalid_args(message);
+
+	if (known_networks_find(ssid, SECURITY_PSK) ||
+			known_networks_find(ssid, SECURITY_NONE))
+		return dbus_error_already_provisioned(message);
+
+	if (station_network_find(station, ssid, SECURITY_PSK) ||
+			station_network_find(station, ssid, SECURITY_NONE))
+		return dbus_error_not_hidden(message);
+
+	params.ssid = ssid;
+
+	station->hidden_network_scan_id = scan_active_full(id, &params,
+				station_hidden_network_scan_triggered,
+				station_hidden_network_scan_results,
+				station, station_hidden_network_scan_destroy);
+	if (!station->hidden_network_scan_id)
+		return dbus_error_failed(message);
+
+	station->connect_pending = l_dbus_message_ref(message);
+
+	return NULL;
+}
+#endif
 
 static void station_disconnect_reconnect_cb(struct netdev *netdev, bool success,
 					void *user_data)
@@ -2372,6 +2642,23 @@ static void station_disconnect_cb(struct netdev *netdev, bool success,
 
 	l_debug("%u, success: %d",
 			netdev_get_ifindex(station->netdev), success);
+
+#ifdef HAVE_DBUS
+	if (station->disconnect_pending) {
+		struct l_dbus_message *reply;
+
+		if (success) {
+			reply = l_dbus_message_new_method_return(
+						station->disconnect_pending);
+			l_dbus_message_set_arguments(reply, "");
+		} else
+			reply = dbus_error_failed(station->disconnect_pending);
+
+
+		dbus_pending_reply(&station->disconnect_pending, reply);
+
+	}
+#endif
 
 	station_enter_state(station, STATION_STATE_DISCONNECTED);
 
@@ -2406,17 +2693,385 @@ int station_disconnect(struct station *station)
 	return 0;
 }
 
+#ifdef HAVE_DBUS
+static struct l_dbus_message *station_dbus_disconnect(struct l_dbus *dbus,
+						struct l_dbus_message *message,
+						void *user_data)
+{
+	struct station *station = user_data;
+	int result;
+
+	l_debug("");
+
+	/*
+	 * Disconnect was triggered by the user, don't autoconnect. Wait for
+	 * the user's explicit instructions to scan and connect to the network
+	 */
+	station_set_autoconnect(station, false);
+
+	if (!station_is_busy(station))
+		return l_dbus_message_new_method_return(message);
+
+	result = station_disconnect(station);
+	if (result < 0)
+		return dbus_error_from_errno(result, message);
+
+	station->disconnect_pending = l_dbus_message_ref(message);
+
+	return NULL;
+}
+
+static struct l_dbus_message *station_dbus_get_networks(struct l_dbus *dbus,
+						struct l_dbus_message *message,
+						void *user_data)
+{
+	struct station *station = user_data;
+	struct l_dbus_message *reply =
+				l_dbus_message_new_method_return(message);
+	struct l_dbus_message_builder *builder =
+				l_dbus_message_builder_new(reply);
+	struct l_queue *sorted = station->networks_sorted;
+	const struct l_queue_entry *entry;
+
+	l_dbus_message_builder_enter_array(builder, "(on)");
+
+	for (entry = l_queue_get_entries(sorted); entry; entry = entry->next) {
+		const struct network *network = entry->data;
+		int16_t signal_strength = network_get_signal_strength(network);
+
+		l_dbus_message_builder_enter_struct(builder, "on");
+		l_dbus_message_builder_append_basic(builder, 'o',
+						network_get_path(network));
+		l_dbus_message_builder_append_basic(builder, 'n',
+							&signal_strength);
+		l_dbus_message_builder_leave_struct(builder);
+	}
+
+	l_dbus_message_builder_leave_array(builder);
+
+	l_dbus_message_builder_finalize(builder);
+	l_dbus_message_builder_destroy(builder);
+
+	return reply;
+}
+
+static struct l_dbus_message *station_dbus_get_hidden_access_points(
+						struct l_dbus *dbus,
+						struct l_dbus_message *message,
+						void *user_data)
+{
+	struct station *station = user_data;
+	struct l_dbus_message *reply =
+				l_dbus_message_new_method_return(message);
+	struct l_dbus_message_builder *builder =
+				l_dbus_message_builder_new(reply);
+	const struct l_queue_entry *entry;
+
+	l_dbus_message_builder_enter_array(builder, "(sns)");
+
+	for (entry = l_queue_get_entries(station->hidden_bss_list_sorted);
+						entry; entry = entry->next) {
+		struct scan_bss *bss = entry->data;
+		int16_t signal_strength = bss->signal_strength;
+		struct ie_rsn_info info;
+		enum security security;
+		int r;
+
+		memset(&info, 0, sizeof(info));
+		r = scan_bss_get_rsn_info(bss, &info);
+		if (r < 0) {
+			if (r != -ENOENT)
+				continue;
+
+			security = security_determine(bss->capability, NULL);
+		} else {
+			security = security_determine(bss->capability, &info);
+		}
+
+		l_dbus_message_builder_enter_struct(builder, "sns");
+		l_dbus_message_builder_append_basic(builder, 's',
+					util_address_to_string(bss->addr));
+		l_dbus_message_builder_append_basic(builder, 'n',
+							&signal_strength);
+		l_dbus_message_builder_append_basic(builder, 's',
+						security_to_str(security));
+		l_dbus_message_builder_leave_struct(builder);
+	}
+
+	l_dbus_message_builder_leave_array(builder);
+
+	l_dbus_message_builder_finalize(builder);
+	l_dbus_message_builder_destroy(builder);
+
+	return reply;
+}
+
+static void station_dbus_scan_triggered(int err, void *user_data)
+{
+	struct station *station = user_data;
+	struct l_dbus_message *reply;
+
+	l_debug("station_scan_triggered: %i", err);
+
+	if (err < 0) {
+		reply = dbus_error_from_errno(err, station->scan_pending);
+		dbus_pending_reply(&station->scan_pending, reply);
+		return;
+	}
+
+	l_debug("Scan triggered for %s", netdev_get_name(station->netdev));
+
+	reply = l_dbus_message_new_method_return(station->scan_pending);
+	l_dbus_message_set_arguments(reply, "");
+	dbus_pending_reply(&station->scan_pending, reply);
+
+	station_property_set_scanning(station, true);
+}
+
+static void station_dbus_scan_destroy(void *userdata)
+{
+	struct station *station = userdata;
+
+	station->dbus_scan_id = 0;
+}
+
+static struct l_dbus_message *station_dbus_scan(struct l_dbus *dbus,
+						struct l_dbus_message *message,
+						void *user_data)
+{
+	struct station *station = user_data;
+
+	l_debug("Scan called from DBus");
+
+	if (station->dbus_scan_id)
+		return dbus_error_busy(message);
+
+	if (station->state == STATION_STATE_CONNECTING)
+		return dbus_error_busy(message);
+
+	station->dbus_scan_id = station_scan_trigger(station, NULL,
+						station_dbus_scan_triggered,
+						new_scan_results,
+						station_dbus_scan_destroy);
+
+	if (!station->dbus_scan_id)
+		return dbus_error_failed(message);
+
+	station->scan_pending = l_dbus_message_ref(message);
+
+	return NULL;
+}
+#endif
+
 struct signal_agent {
 	char *owner;
 	char *path;
 	unsigned int disconnect_watch;
 };
 
+static void station_signal_agent_notify(struct signal_agent *agent,
+					const char *device_path, uint8_t level)
+{
+#ifdef HAVE_DBUS
+	struct l_dbus_message *msg;
+
+	msg = l_dbus_message_new_method_call(dbus_get_bus(),
+						agent->owner, agent->path,
+						IWD_SIGNAL_AGENT_INTERFACE,
+						"Changed");
+	l_dbus_message_set_arguments(msg, "oy", device_path, level);
+	l_dbus_message_set_no_reply(msg, true);
+
+	l_dbus_send(dbus_get_bus(), msg);
+#endif
+}
+
 static void station_rssi_level_changed(struct station *station,
 					uint8_t level_idx)
 {
-    return;
+	struct netdev *netdev = station->netdev;
+
+	if (!station->signal_agent)
+		return;
+
+	station_signal_agent_notify(station->signal_agent,
+					netdev_get_path(netdev), level_idx);
 }
+
+#ifdef HAVE_DBUS
+static void station_signal_agent_release(struct signal_agent *agent,
+						const char *device_path)
+{
+	struct l_dbus_message *msg;
+
+	msg = l_dbus_message_new_method_call(dbus_get_bus(),
+						agent->owner, agent->path,
+						IWD_SIGNAL_AGENT_INTERFACE,
+						"Release");
+	l_dbus_message_set_arguments(msg, "o", device_path);
+	l_dbus_message_set_no_reply(msg, true);
+
+	l_dbus_send(dbus_get_bus(), msg);
+}
+
+static void signal_agent_free(void *data)
+{
+	struct signal_agent *agent = data;
+
+	l_free(agent->owner);
+	l_free(agent->path);
+	l_dbus_remove_watch(dbus_get_bus(), agent->disconnect_watch);
+	l_free(agent);
+}
+
+static void signal_agent_disconnect(struct l_dbus *dbus, void *user_data)
+{
+	struct station *station = user_data;
+
+	l_debug("signal_agent %s disconnected", station->signal_agent->owner);
+
+	l_idle_oneshot(signal_agent_free, station->signal_agent, NULL);
+	station->signal_agent = NULL;
+
+	netdev_set_rssi_report_levels(station->netdev, NULL, 0);
+}
+
+static struct l_dbus_message *station_dbus_signal_agent_register(
+						struct l_dbus *dbus,
+						struct l_dbus_message *message,
+						void *user_data)
+{
+	struct station *station = user_data;
+	const char *path, *sender;
+	struct l_dbus_message_iter level_iter;
+	int8_t levels[16];
+	int err;
+	int16_t val;
+	size_t count = 0;
+
+	if (station->signal_agent)
+		return dbus_error_already_exists(message);
+
+	l_debug("signal agent register called");
+
+	if (!l_dbus_message_get_arguments(message, "oan", &path, &level_iter))
+		return dbus_error_invalid_args(message);
+
+	while (l_dbus_message_iter_next_entry(&level_iter, &val)) {
+		if (count >= L_ARRAY_SIZE(levels) || val > 127 || val < -127)
+			return dbus_error_invalid_args(message);
+
+		levels[count++] = val;
+	}
+
+	if (count < 1)
+		return dbus_error_invalid_args(message);
+
+	err = netdev_set_rssi_report_levels(station->netdev, levels, count);
+	if (err == -ENOTSUP)
+		return dbus_error_not_supported(message);
+	else if (err < 0)
+		return dbus_error_failed(message);
+
+	sender = l_dbus_message_get_sender(message);
+
+	station->signal_agent = l_new(struct signal_agent, 1);
+	station->signal_agent->owner = l_strdup(sender);
+	station->signal_agent->path = l_strdup(path);
+	station->signal_agent->disconnect_watch =
+		l_dbus_add_disconnect_watch(dbus, sender,
+						signal_agent_disconnect,
+						station, NULL);
+
+	l_debug("agent %s path %s", sender, path);
+
+	/*
+	 * TODO: send an initial notification in a oneshot idle callback,
+	 * if state is connected.
+	 */
+
+	return l_dbus_message_new_method_return(message);
+}
+
+static struct l_dbus_message *station_dbus_signal_agent_unregister(
+						struct l_dbus *dbus,
+						struct l_dbus_message *message,
+						void *user_data)
+{
+	struct station *station = user_data;
+	const char *path, *sender;
+
+	if (!station->signal_agent)
+		return dbus_error_failed(message);
+
+	l_debug("signal agent unregister");
+
+	if (!l_dbus_message_get_arguments(message, "o", &path))
+		return dbus_error_invalid_args(message);
+
+	if (strcmp(station->signal_agent->path, path))
+		return dbus_error_not_found(message);
+
+	sender = l_dbus_message_get_sender(message);
+
+	if (strcmp(station->signal_agent->owner, sender))
+		return dbus_error_not_found(message);
+
+	signal_agent_free(station->signal_agent);
+	station->signal_agent = NULL;
+
+	netdev_set_rssi_report_levels(station->netdev, NULL, 0);
+
+	return l_dbus_message_new_method_return(message);
+}
+
+static bool station_property_get_connected_network(struct l_dbus *dbus,
+					struct l_dbus_message *message,
+					struct l_dbus_message_builder *builder,
+					void *user_data)
+{
+	struct station *station = user_data;
+
+	if (!station->connected_network)
+		return false;
+
+	l_dbus_message_builder_append_basic(builder, 'o',
+				network_get_path(station->connected_network));
+
+	return true;
+}
+
+static bool station_property_get_scanning(struct l_dbus *dbus,
+					struct l_dbus_message *message,
+					struct l_dbus_message_builder *builder,
+					void *user_data)
+{
+	struct station *station = user_data;
+	bool scanning = station->scanning;
+
+	l_dbus_message_builder_append_basic(builder, 'b', &scanning);
+
+	return true;
+}
+
+static bool station_property_get_state(struct l_dbus *dbus,
+					struct l_dbus_message *message,
+					struct l_dbus_message_builder *builder,
+					void *user_data)
+{
+	struct station *station = user_data;
+	const char *statestr;
+
+	if (!station_is_busy(station))
+		/* Special case. For now we treat AUTOCONNECT as disconnected */
+		statestr = "disconnected";
+	else
+		statestr = station_state_to_string(station->state);
+
+	l_dbus_message_builder_append_basic(builder, 's', statestr);
+	return true;
+}
+#endif
 
 void station_foreach(station_foreach_func_t func, void *user_data)
 {
@@ -2483,6 +3138,9 @@ struct scan_bss *station_get_connected_bss(struct station *station)
 static struct station *station_create(struct netdev *netdev)
 {
 	struct station *station;
+#ifdef HAVE_DBUS
+	struct l_dbus *dbus = dbus_get_bus();
+#endif
 
 	station = l_new(struct station, 1);
 	watchlist_init(&station->state_watches, NULL);
@@ -2502,12 +3160,121 @@ static struct station *station_create(struct netdev *netdev)
 
 	station_set_autoconnect(station, true);
 
-	station->netconfig = netconfig_new(netdev_get_ifindex(netdev));
+#ifdef HAVE_DBUS
+	l_dbus_object_add_interface(dbus, netdev_get_path(netdev),
+					IWD_STATION_INTERFACE, station);
+#endif
+
+	if (netconfig_enabled)
+		station->netconfig = netconfig_new(netdev_get_ifindex(netdev));
 
 	station->anqp_pending = l_queue_new();
 
 	return station;
 }
+
+#ifdef HAVE_DBUS
+static void station_free(struct station *station)
+{
+	l_debug("");
+
+	if (!l_queue_remove(station_list, station))
+		return;
+
+	if (station->connected_bss)
+		netdev_disconnect(station->netdev, NULL, NULL);
+
+	if (station->netconfig) {
+		netconfig_destroy(station->netconfig);
+		station->netconfig = NULL;
+	}
+
+	periodic_scan_stop(station);
+
+	if (station->signal_agent) {
+		station_signal_agent_release(station->signal_agent,
+					netdev_get_path(station->netdev));
+		signal_agent_free(station->signal_agent);
+	}
+
+	if (station->connect_pending)
+		dbus_pending_reply(&station->connect_pending,
+				dbus_error_aborted(station->connect_pending));
+
+	if (station->disconnect_pending)
+		dbus_pending_reply(&station->disconnect_pending,
+			dbus_error_aborted(station->disconnect_pending));
+
+	if (station->scan_pending)
+		dbus_pending_reply(&station->scan_pending,
+			dbus_error_aborted(station->scan_pending));
+
+	if (station->dbus_scan_id)
+		scan_cancel(netdev_get_wdev_id(station->netdev),
+				station->dbus_scan_id);
+
+	if (station->quick_scan_id)
+		scan_cancel(netdev_get_wdev_id(station->netdev),
+				station->quick_scan_id);
+
+	if (station->hidden_network_scan_id)
+		scan_cancel(netdev_get_wdev_id(station->netdev),
+				station->hidden_network_scan_id);
+
+	station_roam_state_clear(station);
+
+	l_queue_destroy(station->networks_sorted, NULL);
+	l_hashmap_destroy(station->networks, network_free);
+	l_queue_destroy(station->bss_list, bss_free);
+	l_queue_destroy(station->hidden_bss_list_sorted, NULL);
+	l_queue_destroy(station->autoconnect_list, l_free);
+
+	watchlist_destroy(&station->state_watches);
+
+	l_queue_destroy(station->anqp_pending, l_free);
+
+	l_free(station);
+}
+
+static void station_setup_interface(struct l_dbus_interface *interface)
+{
+	l_dbus_interface_method(interface, "ConnectHiddenNetwork", 0,
+				station_dbus_connect_hidden_network,
+				"", "s", "name");
+	l_dbus_interface_method(interface, "Disconnect", 0,
+				station_dbus_disconnect, "", "");
+	l_dbus_interface_method(interface, "GetOrderedNetworks", 0,
+				station_dbus_get_networks, "a(on)", "",
+				"networks");
+	l_dbus_interface_method(interface, "GetHiddenAccessPoints", 0,
+				station_dbus_get_hidden_access_points,
+				"a(sns)", "",
+				"accesspoints");
+	l_dbus_interface_method(interface, "Scan", 0,
+				station_dbus_scan, "", "");
+	l_dbus_interface_method(interface, "RegisterSignalLevelAgent", 0,
+				station_dbus_signal_agent_register,
+				"", "oan", "path", "levels");
+	l_dbus_interface_method(interface, "UnregisterSignalLevelAgent", 0,
+				station_dbus_signal_agent_unregister,
+				"", "o", "path");
+
+	l_dbus_interface_property(interface, "ConnectedNetwork", 0, "o",
+					station_property_get_connected_network,
+					NULL);
+	l_dbus_interface_property(interface, "Scanning", 0, "b",
+					station_property_get_scanning, NULL);
+	l_dbus_interface_property(interface, "State", 0, "s",
+					station_property_get_state, NULL);
+}
+
+static void station_destroy_interface(void *user_data)
+{
+	struct station *station = user_data;
+
+	station_free(station);
+}
+#endif
 
 static void station_netdev_watch(struct netdev *netdev,
 				enum netdev_watch_event event, void *userdata)
@@ -2521,6 +3288,11 @@ static void station_netdev_watch(struct netdev *netdev,
 		break;
 	case NETDEV_WATCH_EVENT_DOWN:
 	case NETDEV_WATCH_EVENT_DEL:
+#ifdef HAVE_DBUS
+		l_dbus_object_remove_interface(dbus_get_bus(),
+						netdev_get_path(netdev),
+						IWD_STATION_INTERFACE);
+#endif
 		break;
 	default:
 		break;
@@ -2531,6 +3303,11 @@ static int station_init(void)
 {
 	station_list = l_queue_new();
 	netdev_watch = netdev_watch_add(station_netdev_watch, NULL, NULL);
+#ifdef HAVE_DBUS
+	l_dbus_register_interface(dbus_get_bus(), IWD_STATION_INTERFACE,
+					station_setup_interface,
+					station_destroy_interface, false);
+#endif
 
 	if (!l_settings_get_uint(iwd_get_config(), "General",
 					"ManagementFrameProtection",
@@ -2547,11 +3324,29 @@ static int station_init(void)
 				&anqp_disabled))
 		anqp_disabled = true;
 
-	return true;
+	if (!l_settings_get_bool(iwd_get_config(), "General",
+					"EnableNetworkConfiguration",
+					&netconfig_enabled)) {
+		if (l_settings_get_bool(iwd_get_config(), "General",
+					"enable_network_config",
+					&netconfig_enabled))
+			l_warn("[General].enable_network_config is deprecated,"
+				" use [General].EnableNetworkConfiguration");
+		else
+			netconfig_enabled = false;
+	}
+
+	if (!netconfig_enabled)
+		l_info("station: Network configuration is disabled.");
+
+	return 0;
 }
 
 static void station_exit(void)
 {
+#ifdef HAVE_DBUS
+	l_dbus_unregister_interface(dbus_get_bus(), IWD_STATION_INTERFACE);
+#endif
 	netdev_watch_remove(netdev_watch);
 	l_queue_destroy(station_list, NULL);
 	station_list = NULL;

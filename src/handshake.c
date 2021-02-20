@@ -145,8 +145,8 @@ static bool handshake_state_setup_own_ciphers(struct handshake_state *s,
 	s->group_management_cipher = info->group_management_cipher;
 
 	/*
-	 * Dont set MFP for OSEN otherwise EAPoL will attempt to negotiate a
-	 * iGTK which is not allowe for OSEN.
+	 * Don't set MFP for OSEN otherwise EAPoL will attempt to negotiate a
+	 * iGTK which is not allowed for OSEN.
 	 */
 	if (!s->osen_ie)
 		s->mfp = info->mfpc;
@@ -410,14 +410,22 @@ bool handshake_state_derive_ptk(struct handshake_state *s)
 
 	s->ptk_complete = false;
 
-	if (s->akm_suite & (IE_RSN_AKM_SUITE_FILS_SHA384 |
+	if (s->akm_suite & IE_RSN_AKM_SUITE_OWE) {
+		if (s->pmk_len == 32)
+			type = L_CHECKSUM_SHA256;
+		else if (s->pmk_len == 48)
+			type = L_CHECKSUM_SHA384;
+		else if (s->pmk_len == 64)
+			type = L_CHECKSUM_SHA512;
+		else
+			return false;
+	} else if (s->akm_suite & (IE_RSN_AKM_SUITE_FILS_SHA384 |
 			IE_RSN_AKM_SUITE_FT_OVER_FILS_SHA384))
 		type = L_CHECKSUM_SHA384;
 	else if (s->akm_suite & (IE_RSN_AKM_SUITE_8021X_SHA256 |
 			IE_RSN_AKM_SUITE_PSK_SHA256 |
 			IE_RSN_AKM_SUITE_SAE_SHA256 |
 			IE_RSN_AKM_SUITE_FT_OVER_SAE_SHA256 |
-			IE_RSN_AKM_SUITE_OWE |
 			IE_RSN_AKM_SUITE_FILS_SHA256 |
 			IE_RSN_AKM_SUITE_FT_OVER_FILS_SHA256 |
 			IE_RSN_AKM_SUITE_OSEN))
@@ -565,7 +573,7 @@ void handshake_state_install_ptk(struct handshake_state *s)
 }
 
 void handshake_state_install_gtk(struct handshake_state *s,
-					uint8_t gtk_key_index,
+					uint16_t gtk_key_index,
 					const uint8_t *gtk, size_t gtk_len,
 					const uint8_t *rsc, uint8_t rsc_len)
 {
@@ -579,7 +587,7 @@ void handshake_state_install_gtk(struct handshake_state *s,
 }
 
 void handshake_state_install_igtk(struct handshake_state *s,
-					uint8_t igtk_key_index,
+					uint16_t igtk_key_index,
 					const uint8_t *igtk, size_t igtk_len,
 					const uint8_t *ipn)
 {

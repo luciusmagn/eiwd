@@ -39,6 +39,7 @@ ell_headers = ell/util.h \
 			ell/netlink.h \
 			ell/genl.h \
 			ell/dbus.h \
+			ell/rtnl.h \
 			ell/dbus-service.h \
 			ell/dbus-client.h \
 			ell/hwdb.h \
@@ -82,8 +83,8 @@ ell_sources = ell/private.h \
 			ell/checksum.c \
 			ell/netlink-private.h \
 			ell/netlink.c \
-			ell/genl-private.h \
 			ell/genl.c \
+			ell/rtnl.c \
 			ell/dbus-private.h \
 			ell/dbus.c \
 			ell/dbus-message.c \
@@ -133,18 +134,34 @@ ell_libell_internal_la_SOURCES = $(ell_headers) $(ell_sources)
 endif
 
 bin_PROGRAMS =
-bin_SCRIPTS = iwd_passphrase iwc
+bin_SCRIPTS = iwd_passphrase
 libexec_PROGRAMS =
 noinst_PROGRAMS =
 
-if MANUAL_PAGES
-man_MANS =
+if DBUS_POLICY
+dbus_datadir = @DBUS_DATADIR@/dbus-1/system.d
+dist_dbus_data_DATA =
 endif
+
+if SYSTEMD_SERVICE
+systemd_unitdir = @SYSTEMD_UNITDIR@
+systemd_unit_DATA =
+
+dbus_busdir = @DBUS_BUSDIR@
+dbus_bus_DATA =
+
+systemd_networkdir = @SYSTEMD_NETWORKDIR@
+systemd_network_DATA =
+
+systemd_modloaddir = @SYSTEMD_MODLOADDIR@
+systemd_modload_DATA = src/pkcs8.conf
+endif
+
+man_MANS =
 
 manual_pages = src/iwd.8 src/iwd.debug.7 src/iwd.config.5 src/iwd.network.5
 
 eap_sources = src/eap.c src/eap.h src/eap-private.h \
-				src/eap-wsc.c src/eap-wsc.h \
 				src/eap-md5.c \
 				src/eap-tls.c \
 				src/eap-ttls.c \
@@ -156,7 +173,6 @@ eap_sources = src/eap.c src/eap.h src/eap-private.h \
 				src/eap-pwd.c \
 				src/util.h src/util.c \
 				src/crypto.h src/crypto.c \
-				src/wscutil.h src/wscutil.c \
 				src/simutil.h src/simutil.c \
 				src/simauth.h src/simauth.c \
 				src/watchlist.h src/watchlist.c \
@@ -182,7 +198,7 @@ src_iwd_SOURCES = src/main.c linux/nl80211.h src/iwd.h src/missing.h \
 					src/agent.h src/agent.c \
 					src/storage.h src/storage.c \
 					src/network.h src/network.c \
-					src/wsc.c \
+					src/wsc.h src/wsc.c \
 					src/backtrace.h src/backtrace.c \
 					src/knownnetworks.h \
 					src/knownnetworks.c \
@@ -197,18 +213,25 @@ src_iwd_SOURCES = src/main.c linux/nl80211.h src/iwd.h src/missing.h \
 					src/manager.c \
 					src/erp.h src/erp.c \
 					src/fils.h src/fils.c \
-					src/rtnlutil.h src/rtnlutil.c \
 					src/auth-proto.h \
 					src/anqp.h src/anqp.c \
 					src/anqputil.h src/anqputil.c \
 					src/netconfig.h src/netconfig.c\
 					src/resolve.h src/resolve.c\
 					src/hotspot.c \
+					src/p2p.h src/p2p.c \
 					src/p2putil.h src/p2putil.c \
 					src/module.h src/module.c \
 					src/rrm.c \
+					src/frame-xchg.h src/frame-xchg.c \
+					src/eap-wsc.c src/eap-wsc.h \
+					src/wscutil.h src/wscutil.c \
 					$(eap_sources) \
 					$(builtin_sources)
+
+if DBUS
+src_iwd_SOURCES += src/dbus.h src/dbus.c
+endif
 
 src_iwd_LDADD = $(ell_ldadd) -ldl
 src_iwd_DEPENDENCIES = $(ell_dependencies)
@@ -218,8 +241,125 @@ builtin_modules += sim_hardcoded
 builtin_sources += plugins/sim_hardcoded.c
 endif
 
-if MANUAL_PAGES
+if OFONO
+builtin_modules += ofono
+builtin_sources += plugins/ofono.c
+endif
+
+if DBUS_POLICY
+dist_dbus_data_DATA += src/iwd-dbus.conf
+endif
+
+if SYSTEMD_SERVICE
+src_iwd_DEPENDENCIES += src/iwd.service
+
+systemd_unit_DATA += src/iwd.service
+dbus_bus_DATA += src/net.connman.iwd.service
+
+systemd_network_DATA += src/80-iwd.link
+endif
+
 man_MANS += src/iwd.8 src/iwd.debug.7 src/iwd.config.5 src/iwd.network.5
+endif
+
+if CLIENT
+bin_PROGRAMS += client/iwctl
+
+client_iwctl_SOURCES = client/main.c \
+			client/adapter.c \
+			client/agent.h client/agent.c \
+			client/agent-manager.h client/agent-manager.c \
+			client/ad-hoc.c \
+			client/ap.c \
+			client/command.h client/command.c \
+			client/dbus-proxy.h client/dbus-proxy.c \
+			client/device.h client/device.c \
+			client/display.h client/display.c \
+			client/known-networks.c \
+			client/network.h client/network.c \
+			client/properties.h client/properties.c \
+			client/wsc.c client/station.c
+client_iwctl_LDADD = $(ell_ldadd) -lreadline
+
+if MANUAL_PAGES
+man_MANS += client/iwctl.1
+endif
+endif
+
+if MONITOR
+bin_PROGRAMS += monitor/iwmon
+
+monitor_iwmon_SOURCES = monitor/main.c linux/nl80211.h \
+					monitor/nlmon.h monitor/nlmon.c \
+					monitor/pcap.h monitor/pcap.c \
+					monitor/display.h monitor/display.c \
+					src/ie.h src/ie.c \
+					src/wscutil.h src/wscutil.c \
+					src/mpdu.h src/mpdu.c \
+					src/util.h src/util.c \
+					src/crypto.h src/crypto.c \
+					src/watchlist.h src/watchlist.c \
+					src/eapolutil.h src/eapolutil.c \
+					src/handshake.h src/handshake.c \
+					src/nl80211cmd.h src/nl80211cmd.c \
+					src/p2putil.c src/p2putil.h \
+					src/anqputil.h src/anqputil.c
+monitor_iwmon_LDADD = $(ell_ldadd)
+
+man_MANS += monitor/iwmon.1
+endif
+
+if WIRED
+libexec_PROGRAMS += wired/ead
+
+wired_ead_SOURCES = wired/main.c wired/ethdev.h wired/ethdev.c \
+				wired/network.h wired/network.c \
+				wired/dbus.h wired/dbus.c \
+				src/module.h src/module.c \
+				$(eap_sources)
+wired_ead_LDADD = $(ell_ldadd)
+wired_ead_DEPENDENCIES = $(ell_dependencies)
+
+if DBUS_POLICY
+dist_dbus_data_DATA += wired/ead-dbus.conf
+endif
+
+if SYSTEMD_SERVICE
+wired_ead_DEPENDENCIES += wired/ead.service
+
+systemd_unit_DATA += wired/ead.service
+dbus_bus_DATA += wired/net.connman.ead.service
+endif
+
+if MANUAL_PAGES
+man_MANS += wired/ead.8
+endif
+endif
+
+noinst_PROGRAMS += tools/probe-req
+
+tools_probe_req_SOURCES = tools/probe-req.c src/mpdu.h src/mpdu.c \
+					src/ie.h src/ie.c \
+					src/nl80211util.h src/nl80211util.c \
+					src/util.h src/util.c \
+					src/common.h src/common.c
+tools_probe_req_LDADD = $(ell_ldadd)
+
+if HWSIM
+bin_PROGRAMS += tools/hwsim
+
+tools_hwsim_SOURCES = tools/hwsim.c src/mpdu.h \
+					src/util.h src/util.c \
+					src/storage.h src/storage.c \
+					src/common.h src/common.c
+tools_hwsim_LDADD = $(ell_ldadd)
+
+if DBUS_POLICY
+dist_dbus_data_DATA += tools/hwsim-dbus.conf
+endif
+
+if MANUAL_PAGES
+man_MANS += tools/hwsim.1
 endif
 endif
 
@@ -374,6 +514,10 @@ AM_CFLAGS = $(ell_cflags) -fvisibility=hidden \
 				-DUNITDIR=\""$(top_srcdir)/unit/"\" \
 				-DCERTDIR=\""$(top_builddir)/unit/"\"
 
+if DBUS
+AM_CFLAGS += -DHAVE_DBUS
+endif
+
 if MAINTAINER_MODE
 AM_CFLAGS += -DHAVE_PKCS8_SUPPORT
 endif
@@ -461,7 +605,7 @@ ell/internal: Makefile
 	$(AM_V_at)$(MKDIR_P) ell
 	$(AM_V_GEN)for f in $(ell_headers) $(ell_sources) ; do \
 		if [ ! -f $$f ] ; then \
-			$(LN_S) -f $(abs_srcdir)/../ell/$$f $$f ; \
+			$(LN_S) -f $(abs_srcdir)/../ell/$$f ; \
 		fi \
 	done > $@
 
@@ -476,8 +620,9 @@ SED_PROCESS = $(AM_V_GEN)$(MKDIR_P) $(dir $@) && $(SED) \
 		< $< > $@
 
 if RUN_RST2MAN
-RST2MAN_PROCESS = $(AM_V_GEN)$(RST2MAN) --strict --no-raw --no-generator \
-			--no-datestamp $< $@
+RST2MAN_PROCESS = $(AM_V_GEN)$(MKDIR_P) $(dir $@) && \
+			$(RST2MAN) --strict --no-raw \
+			--no-generator --no-datestamp $< $@
 else
 RST2MAN_PROCESS = $(AM_V_GEN)test -f $@ || \
 		{ echo "Generated manual page $@ does not exist"; false; }

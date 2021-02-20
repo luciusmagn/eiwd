@@ -112,6 +112,7 @@ struct eap_tls_state {
 	size_t tx_frag_last_len;
 
 	bool expecting_frag_ack:1;
+	bool tunnel_ready:1;
 
 	struct l_queue *ca_cert;
 	struct l_certchain *client_cert;
@@ -128,6 +129,7 @@ static void __eap_tls_common_state_reset(struct eap_tls_state *eap_tls)
 	eap_tls->method_completed = false;
 	eap_tls->phase2_failed = false;
 	eap_tls->expecting_frag_ack = false;
+	eap_tls->tunnel_ready = false;
 
 	if (eap_tls->tunnel) {
 		l_tls_free(eap_tls->tunnel);
@@ -244,11 +246,20 @@ static void eap_tls_tunnel_ready(const char *peer_identity, void *user_data)
 	 */
 	eap_start_complete_timeout(eap);
 
+	eap_tls->tunnel_ready = true;
+
 	if (!eap_tls->variant_ops->tunnel_ready)
 		return;
 
 	if (!eap_tls->variant_ops->tunnel_ready(eap, peer_identity))
 		l_tls_close(eap_tls->tunnel);
+}
+
+static void eap_tls_debug_hint(void)
+{
+	if (!getenv("IWD_TLS_DEBUG"))
+		l_debug("set the IWD_TLS_DEBUG environment variable to see "
+			"more information");
 }
 
 static void eap_tls_tunnel_disconnected(enum l_tls_alert_desc reason,
@@ -261,6 +272,7 @@ static void eap_tls_tunnel_disconnected(enum l_tls_alert_desc reason,
 			eap_get_method_name(eap), l_tls_alert_to_str(reason));
 
 	eap_tls->method_completed = true;
+	eap_tls->tunnel_ready = false;
 }
 
 static bool eap_tls_validate_version(struct eap_state *eap,
@@ -325,11 +337,32 @@ static void eap_tls_send_fragment(struct eap_state *eap)
 	eap_tls->tx_frag_last_len = len;
 }
 
+static bool needs_workaround(struct eap_state *eap)
+{
+	struct eap_tls_state *eap_tls = eap_get_data(eap);
+
+	/*
+	 * Windows Server 2008 - Network Policy Server (NPS) generates an
+	 * invalid Compound MAC for Cryptobinding TLV when is used within PEAPv0
+	 * due to incorrect parsing of the message containing TLS Client Hello.
+	 * Setting L bit and including TLS Message Length field, even for the
+	 * packets that do not require fragmentation, corrects the issue. The
+	 * redundant TLS Message Length field in unfragmented packets doesn't
+	 * seem to effect the other server implementations.
+	 */
+	return eap_get_method_type(eap) == EAP_TYPE_PEAP &&
+			eap_tls->version_negotiated == EAP_TLS_VERSION_0 &&
+			!eap_tls->tunnel_ready;
+}
+
 static void eap_tls_send_response(struct eap_state *eap,
 					const uint8_t *pdu, size_t pdu_len)
 {
 	struct eap_tls_state *eap_tls = eap_get_data(eap);
 	size_t msg_len = EAP_TLS_HEADER_LEN + pdu_len;
+	bool set_tls_msg_len = needs_workaround(eap);
+
+	msg_len += set_tls_msg_len ? 4 : 0;
 
 	if (msg_len <= eap_get_mtu(eap)) {
 		uint8_t *buf;
@@ -344,6 +377,15 @@ static void eap_tls_send_response(struct eap_state *eap,
 
 		buf[EAP_TLS_HEADER_OCTET_FLAGS + extra] =
 						eap_tls->version_negotiated;
+
+		if (set_tls_msg_len) {
+			buf[extra + EAP_TLS_HEADER_OCTET_FLAGS] |=
+								EAP_TLS_FLAG_L;
+			l_put_be32(pdu_len,
+				   &buf[extra + EAP_TLS_HEADER_OCTET_FRAG_LEN]);
+
+			extra += 4;
+		}
 
 		memcpy(buf + EAP_TLS_HEADER_LEN + extra, pdu, pdu_len);
 
@@ -401,7 +443,7 @@ static int eap_tls_init_request_assembly(struct eap_state *eap,
 	len -= 4;
 
 	if (!tls_msg_len || tls_msg_len > EAP_TLS_PDU_MAX_LEN) {
-		l_warn("%s: Fragmented pkt size is outside of alowed"
+		l_warn("%s: Fragmented pkt size is outside of allowed"
 				" boundaries [1, %u]", eap_get_method_name(eap),
 							EAP_TLS_PDU_MAX_LEN);
 
@@ -557,6 +599,7 @@ static bool eap_tls_tunnel_init(struct eap_state *eap)
 
 			l_error("%s: Failed to set auth data.",
 					eap_get_method_name(eap));
+			eap_tls_debug_hint();
 			return false;
 		}
 
@@ -571,6 +614,7 @@ static bool eap_tls_tunnel_init(struct eap_state *eap)
 			eap_tls->ca_cert = NULL;
 			l_error("%s: Error settings CA certificates.",
 					eap_get_method_name(eap));
+			eap_tls_debug_hint();
 			return false;
 		}
 
@@ -583,6 +627,7 @@ static bool eap_tls_tunnel_init(struct eap_state *eap)
 	if (!l_tls_start(eap_tls->tunnel)) {
 		l_error("%s: Failed to start the TLS client",
 						eap_get_method_name(eap));
+		eap_tls_debug_hint();
 		return false;
 	}
 
@@ -1103,7 +1148,7 @@ bool eap_tls_common_settings_load(struct eap_state *eap,
 	if (value) {
 		eap_tls->client_cert = eap_tls_load_client_cert(settings,
 								value);
-		if (!eap_tls->ca_cert) {
+		if (!eap_tls->client_cert) {
 			l_error("Could not load ClientCert %s", value);
 			goto load_error;
 		}

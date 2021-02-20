@@ -39,7 +39,6 @@
 #include "src/station.h"
 #include "src/common.h"
 #include "src/network.h"
-#include "src/rtnlutil.h"
 #include "src/resolve.h"
 #include "src/netconfig.h"
 
@@ -131,15 +130,24 @@ static struct netconfig_ifaddr *netconfig_ipv4_get_ifaddr(
 	case RTPROT_STATIC:
 
 		ip = l_settings_get_string(netconfig->active_settings, "IPv4",
-									"ip");
-		if (!ip)
-			return NULL;
+								"Address");
+		if (!ip) {
+			ip = l_settings_get_string(netconfig->active_settings,
+							"IPv4", "ip");
+			if (!ip)
+				return NULL;
+		}
 
 		ifaddr = l_new(struct netconfig_ifaddr, 1);
 		ifaddr->ip = ip;
 
 		netmask = l_settings_get_string(netconfig->active_settings,
-							"IPv4", "netmask");
+							"IPv4", "Netmask");
+		if (!netmask)
+			netmask = l_settings_get_string(
+						netconfig->active_settings,
+						"IPv4", "netmask");
+
 		if (netmask && inet_pton(AF_INET, netmask, &in_addr) > 0)
 			ifaddr->prefix_len = __builtin_popcountl(
 						L_BE32_TO_CPU(in_addr.s_addr));
@@ -150,7 +158,13 @@ static struct netconfig_ifaddr *netconfig_ipv4_get_ifaddr(
 
 		ifaddr->broadcast =
 			l_settings_get_string(netconfig->active_settings,
-							"IPv4", "broadcast");
+							"IPv4", "Broadcast");
+		if (!ifaddr->broadcast)
+			ifaddr->broadcast =
+				l_settings_get_string(
+						netconfig->active_settings,
+						"IPv4", "broadcast");
+
 		ifaddr->family = AF_INET;
 
 		return ifaddr;
@@ -189,12 +203,18 @@ static struct netconfig_ifaddr *netconfig_ipv4_get_ifaddr(
 static char *netconfig_ipv4_get_gateway(struct netconfig *netconfig)
 {
 	const struct l_dhcp_lease *lease;
+	char *gateway;
 
 	switch (netconfig->rtm_protocol) {
 	case RTPROT_STATIC:
+		gateway = l_settings_get_string(netconfig->active_settings,
+							"IPv4", "Gateway");
+		if (!gateway)
+			gateway = l_settings_get_string(
+						netconfig->active_settings,
+						"IPv4", "gateway");
 
-		return l_settings_get_string(netconfig->active_settings,
-							"IPv4", "gateway");
+		return gateway;
 
 	case RTPROT_DHCP:
 		lease = l_dhcp_client_get_lease(netconfig->dhcp_client);
@@ -212,12 +232,18 @@ static char **netconfig_ipv4_get_dns(struct netconfig *netconfig, uint8_t proto)
 	const struct l_dhcp_lease *lease;
 	struct in_addr in_addr;
 	char **dns_list;
-	char **p;
 
-	p = dns_list = l_settings_get_string_list(netconfig->active_settings,
-							"IPv4", "dns", ' ');
+	dns_list = l_settings_get_string_list(netconfig->active_settings,
+							"IPv4", "DNS", ' ');
+	if (!dns_list)
+		dns_list = l_settings_get_string_list(
+						netconfig->active_settings,
+						"IPv4", "dns", ' ');
+
 	if (dns_list && *dns_list) {
-		for (; *p; p++) {
+		char **p;
+
+		for (p = dns_list; *p; p++) {
 			if (inet_pton(AF_INET, *p, &in_addr) == 1)
 				continue;
 
@@ -251,6 +277,28 @@ static char **netconfig_ipv4_get_dns(struct netconfig *netconfig, uint8_t proto)
 	return NULL;
 }
 
+static char *netconfig_ipv4_get_domain_name(struct netconfig *netconfig,
+								uint8_t proto)
+{
+	const struct l_dhcp_lease *lease;
+	char *domain_name;
+
+	domain_name = l_settings_get_string(netconfig->active_settings,
+							"IPv4", "DomainName");
+	if (domain_name)
+		/* Allow to override the DHCP domain name with setting entry. */
+		return domain_name;
+
+	if (proto != RTPROT_DHCP)
+		return NULL;
+
+	lease = l_dhcp_client_get_lease(netconfig->dhcp_client);
+	if (!lease)
+		return NULL;
+
+	return l_dhcp_lease_get_domain_name(lease);
+}
+
 static struct netconfig_ifaddr *netconfig_ipv6_get_ifaddr(
 						struct netconfig *netconfig,
 						uint8_t proto)
@@ -263,9 +311,13 @@ static struct netconfig_ifaddr *netconfig_ipv6_get_ifaddr(
 	switch (proto) {
 	case RTPROT_STATIC:
 		ip = l_settings_get_string(netconfig->active_settings, "IPv6",
-									"ip");
-		if (!ip)
-			return NULL;
+								"Address");
+		if (!ip) {
+			ip = l_settings_get_string(netconfig->active_settings,
+								"IPv6", "ip");
+			if (!ip)
+				return NULL;
+		}
 
 		ifaddr = l_new(struct netconfig_ifaddr, 1);
 		ifaddr->ip = ip;
@@ -320,7 +372,11 @@ static char *netconfig_ipv6_get_gateway(struct netconfig *netconfig)
 	switch (netconfig->rtm_v6_protocol) {
 	case RTPROT_STATIC:
 		gateway = l_settings_get_string(netconfig->active_settings,
-							"IPv6", "gateway");
+							"IPv6", "Gateway");
+		if (!gateway)
+			gateway = l_settings_get_string(
+						netconfig->active_settings,
+						"IPv6", "gateway");
 
 		if (inet_pton(AF_INET6, gateway, &in6_addr) < 1) {
 			l_error("netconfig: Invalid IPv6 gateway address %s is "
@@ -347,12 +403,19 @@ static char **netconfig_ipv6_get_dns(struct netconfig *netconfig, uint8_t proto)
 {
 	struct in6_addr in6_addr;
 	char **dns_list;
-	char **p;
 
-	p = dns_list = l_settings_get_string_list(netconfig->active_settings,
-							"IPv6", "dns", ' ');
+	dns_list = l_settings_get_string_list(netconfig->active_settings,
+							"IPv6", "DNS", ' ');
+
+	if (!dns_list)
+		dns_list = l_settings_get_string_list(
+						netconfig->active_settings,
+						"IPv6", "dns", ' ');
+
 	if (dns_list && *dns_list) {
-		for (; *p; p++) {
+		char **p;
+
+		for (p = dns_list; *p; p++) {
 			if (inet_pton(AF_INET6, *p, &in6_addr) == 1)
 				continue;
 
@@ -438,8 +501,8 @@ static void netconfig_ifaddr_added(struct netconfig *netconfig,
 	ifaddr->family = ifa->ifa_family;
 	ifaddr->prefix_len = ifa->ifa_prefixlen;
 
-	rtnl_ifaddr_extract(ifa, len, &label, &ifaddr->ip,
-							&ifaddr->broadcast);
+	l_rtnl_ifaddr4_extract(ifa, len, &label, &ifaddr->ip,
+					&ifaddr->broadcast);
 
 	l_debug("%s: ifaddr %s/%u broadcast %s", label, ifaddr->ip,
 					ifaddr->prefix_len, ifaddr->broadcast);
@@ -455,7 +518,7 @@ static void netconfig_ifaddr_deleted(struct netconfig *netconfig,
 	struct netconfig_ifaddr *ifaddr;
 	struct netconfig_ifaddr query;
 
-	rtnl_ifaddr_extract(ifa, len, NULL, &query.ip, NULL);
+	l_rtnl_ifaddr4_extract(ifa, len, NULL, &query.ip, NULL);
 
 	query.family = ifa->ifa_family;
 	query.prefix_len = ifa->ifa_prefixlen;
@@ -522,7 +585,7 @@ static void netconfig_ifaddr_ipv6_added(struct netconfig *netconfig,
 	ifaddr->family = ifa->ifa_family;
 	ifaddr->prefix_len = ifa->ifa_prefixlen;
 
-	rtnl_ifaddr_ipv6_extract(ifa, len, &ifaddr->ip);
+	l_rtnl_ifaddr6_extract(ifa, len, &ifaddr->ip);
 
 	l_debug("ifindex %u: ifaddr %s/%u", netconfig->ifindex, ifaddr->ip,
 							ifaddr->prefix_len);
@@ -537,7 +600,7 @@ static void netconfig_ifaddr_ipv6_deleted(struct netconfig *netconfig,
 	struct netconfig_ifaddr *ifaddr;
 	struct netconfig_ifaddr query;
 
-	rtnl_ifaddr_ipv6_extract(ifa, len, &query.ip);
+	l_rtnl_ifaddr6_extract(ifa, len, &query.ip);
 
 	query.family = ifa->ifa_family;
 	query.prefix_len = ifa->ifa_prefixlen;
@@ -643,7 +706,7 @@ static bool netconfig_ipv4_routes_install(struct netconfig *netconfig,
 	if (!network)
 		return false;
 
-	if (!rtnl_route_ipv4_add_connected(rtnl, netconfig->ifindex,
+	if (!l_rtnl_route4_add_connected(rtnl, netconfig->ifindex,
 						ifaddr->prefix_len, network,
 						ifaddr->ip,
 						netconfig->rtm_protocol,
@@ -663,7 +726,7 @@ static bool netconfig_ipv4_routes_install(struct netconfig *netconfig,
 		return false;
 	}
 
-	if (!rtnl_route_ipv4_add_gateway(rtnl, netconfig->ifindex, gateway,
+	if (!l_rtnl_route4_add_gateway(rtnl, netconfig->ifindex, gateway,
 						ifaddr->ip,
 						ROUTE_PRIORITY_OFFSET,
 						netconfig->rtm_protocol,
@@ -685,6 +748,7 @@ static void netconfig_ipv4_ifaddr_add_cmd_cb(int error, uint16_t type,
 	struct netconfig *netconfig = user_data;
 	struct netconfig_ifaddr *ifaddr;
 	char **dns;
+	char *domain_name;
 
 	if (error && error != -EEXIST) {
 		l_error("netconfig: Failed to add IP address. "
@@ -709,11 +773,20 @@ static void netconfig_ipv4_ifaddr_add_cmd_cb(int error, uint16_t type,
 	dns = netconfig_ipv4_get_dns(netconfig, netconfig->rtm_protocol);
 	if (!dns) {
 		l_error("netconfig: Failed to obtain DNS addresses.");
-		goto done;
+		goto domain_name;
 	}
 
 	resolve_add_dns(netconfig->ifindex, ifaddr->family, dns);
 	l_strv_free(dns);
+
+domain_name:
+	domain_name = netconfig_ipv4_get_domain_name(netconfig,
+						netconfig->rtm_protocol);
+	if (!domain_name)
+		goto done;
+
+	resolve_add_domain_name(netconfig->ifindex, domain_name);
+	l_free(domain_name);
 
 done:
 	netconfig_ifaddr_destroy(ifaddr);
@@ -732,7 +805,7 @@ static bool netconfig_ipv6_routes_install(struct netconfig *netconfig)
 		return false;
 	}
 
-	if (!rtnl_route_ipv6_add_gateway(rtnl, netconfig->ifindex, gateway,
+	if (!l_rtnl_route6_add_gateway(rtnl, netconfig->ifindex, gateway,
 						ROUTE_PRIORITY_OFFSET,
 						netconfig->rtm_v6_protocol,
 						netconfig_route_add_cmd_cb,
@@ -786,7 +859,7 @@ static void netconfig_install_address(struct netconfig *netconfig,
 
 	switch (ifaddr->family) {
 	case AF_INET:
-		if (rtnl_ifaddr_add(rtnl, netconfig->ifindex,
+		if (l_rtnl_ifaddr4_add(rtnl, netconfig->ifindex,
 					ifaddr->prefix_len, ifaddr->ip,
 					ifaddr->broadcast,
 					netconfig_ipv4_ifaddr_add_cmd_cb,
@@ -797,7 +870,7 @@ static void netconfig_install_address(struct netconfig *netconfig,
 							ifaddr->prefix_len);
 		break;
 	case AF_INET6:
-		if (rtnl_ifaddr_ipv6_add(rtnl, netconfig->ifindex,
+		if (l_rtnl_ifaddr6_add(rtnl, netconfig->ifindex,
 					ifaddr->prefix_len, ifaddr->ip,
 					netconfig_ipv6_ifaddr_add_cmd_cb,
 					netconfig, NULL))
@@ -842,7 +915,7 @@ static void netconfig_uninstall_address(struct netconfig *netconfig,
 
 	switch (ifaddr->family) {
 	case AF_INET:
-		if (rtnl_ifaddr_delete(rtnl, netconfig->ifindex,
+		if (l_rtnl_ifaddr4_delete(rtnl, netconfig->ifindex,
 					ifaddr->prefix_len, ifaddr->ip,
 					ifaddr->broadcast,
 					netconfig_ifaddr_del_cmd_cb, netconfig,
@@ -853,7 +926,7 @@ static void netconfig_uninstall_address(struct netconfig *netconfig,
 						ifaddr->ip, ifaddr->prefix_len);
 		break;
 	case AF_INET6:
-		if (rtnl_ifaddr_ipv6_delete(rtnl, netconfig->ifindex,
+		if (l_rtnl_ifaddr6_delete(rtnl, netconfig->ifindex,
 					ifaddr->prefix_len, ifaddr->ip,
 					netconfig_ifaddr_del_cmd_cb, netconfig,
 					NULL))
@@ -1020,7 +1093,7 @@ static void netconfig_ipv6_select_and_uninstall(struct netconfig *netconfig)
 	if (!gateway)
 		return;
 
-	if (!rtnl_route_ipv6_delete_gateway(rtnl, netconfig->ifindex,
+	if (!l_rtnl_route6_delete_gateway(rtnl, netconfig->ifindex,
 			gateway, ROUTE_PRIORITY_OFFSET,
 			netconfig->rtm_v6_protocol,
 			netconfig_route_del_cmd_cb, NULL, NULL)) {
@@ -1105,7 +1178,7 @@ void netconfig_destroy(struct netconfig *netconfig)
 	if (!netconfig_list)
 		return;
 
-	l_debug();
+	l_debug("");
 
 	l_queue_remove(netconfig_list, netconfig);
 
@@ -1120,36 +1193,12 @@ void netconfig_destroy(struct netconfig *netconfig)
 
 static int netconfig_init(void)
 {
-	bool enabled;
 	uint32_t r;
 
 	if (netconfig_list)
 		return -EALREADY;
 
-	if (!l_settings_get_bool(iwd_get_config(), "General",
-					"EnableNetworkConfiguration",
-					&enabled)) {
-		if (l_settings_get_bool(iwd_get_config(), "General",
-					"enable_network_config", &enabled))
-			l_warn("[General].enable_network_config is deprecated,"
-				" use [General].EnableNetworkConfiguration");
-		else
-			enabled = false;
-	}
-
-	if (!enabled) {
-		l_info("netconfig: Network configuration is disabled.");
-		return 0;
-	}
-
-	rtnl = l_netlink_new(NETLINK_ROUTE);
-	if (!rtnl) {
-		l_error("netconfig: Failed to open route netlink socket");
-		return -EPERM;
-	}
-
-	if (getenv("IWD_RTNL_DEBUG"))
-		l_netlink_set_debug(rtnl, do_debug, "[NETCONFIG RTNL] ", NULL);
+	rtnl = iwd_get_rtnl();
 
 	r = l_netlink_register(rtnl, RTNLGRP_IPV4_IFADDR,
 					netconfig_ifaddr_notify, NULL, NULL);
@@ -1159,7 +1208,7 @@ static int netconfig_init(void)
 		goto error;
 	}
 
-	r = rtnl_ifaddr_get(rtnl, netconfig_ifaddr_cmd_cb, NULL, NULL);
+	r = l_rtnl_ifaddr4_dump(rtnl, netconfig_ifaddr_cmd_cb, NULL, NULL);
 	if (!r) {
 		l_error("netconfig: Failed to get addresses from RTNL link.");
 		goto error;
@@ -1173,7 +1222,7 @@ static int netconfig_init(void)
 		goto error;
 	}
 
-	r = rtnl_ifaddr_ipv6_get(rtnl, netconfig_ifaddr_ipv6_cmd_cb, NULL,
+	r = l_rtnl_ifaddr6_dump(rtnl, netconfig_ifaddr_ipv6_cmd_cb, NULL,
 									NULL);
 	if (!r) {
 		l_error("netconfig: Failed to get IPv6 addresses from RTNL"
@@ -1191,7 +1240,6 @@ static int netconfig_init(void)
 	return 0;
 
 error:
-	l_netlink_destroy(rtnl);
 	rtnl = NULL;
 
 	return r;
@@ -1202,7 +1250,6 @@ static void netconfig_exit(void)
 	if (!netconfig_list)
 		return;
 
-	l_netlink_destroy(rtnl);
 	rtnl = NULL;
 
 	l_queue_destroy(netconfig_list, netconfig_free);

@@ -60,7 +60,7 @@
 #include "src/owe.h"
 #include "src/fils.h"
 #include "src/auth-proto.h"
-#include "src/rtnlutil.h"
+#include "src/frame-xchg.h"
 
 #ifndef ENOTSUPP
 #define ENOTSUPP 524
@@ -109,6 +109,7 @@ struct netdev {
 	uint32_t set_interface_cmd_id;
 	uint32_t rekey_offload_cmd_id;
 	uint32_t qos_map_cmd_id;
+	uint32_t mac_change_cmd_id;
 	enum netdev_result result;
 	uint16_t last_code; /* reason or status, depending on result */
 	struct l_timeout *neighbor_report_timeout;
@@ -124,13 +125,12 @@ struct netdev {
 	int8_t cur_rssi;
 	struct l_timeout *rssi_poll_timeout;
 	uint32_t rssi_poll_cmd_id;
+	uint8_t set_mac_once[6];
 
 	uint32_t set_powered_cmd_id;
 	netdev_command_cb_t set_powered_cb;
 	void *set_powered_user_data;
 	netdev_destroy_func_t set_powered_destroy;
-
-	struct watchlist frame_watches;
 
 	struct watchlist station_watches;
 
@@ -146,7 +146,6 @@ struct netdev {
 	bool ignore_connect_event : 1;
 	bool expect_connect_failure : 1;
 	bool aborting : 1;
-	bool mac_randomize_once : 1;
 	bool events_ready : 1;
 };
 
@@ -162,25 +161,12 @@ struct netdev_watch {
 	void *user_data;
 };
 
-struct netdev_frame_watch {
-	uint16_t frame_type;
-	uint8_t *prefix;
-	size_t prefix_len;
-	struct watchlist_item super;
-};
-
 static struct l_netlink *rtnl = NULL;
 static struct l_genl_family *nl80211;
 static struct l_queue *netdev_list;
 static struct watchlist netdev_watches;
 static bool pae_over_nl80211;
-
-static void do_debug(const char *str, void *user_data)
-{
-	const char *prefix = user_data;
-
-	l_info("%s%s", prefix, str);
-}
+static bool mac_per_ssid;
 
 /* Cancels ongoing GTK/IGTK related commands (if any) */
 static void netdev_handshake_state_cancel_rekey(
@@ -235,7 +221,7 @@ struct handshake_state *netdev_handshake_state_new(struct netdev *netdev)
 	nhs->netdev = netdev;
 	/*
 	 * Since GTK/IGTK are optional (NO_GROUP_TRAFFIC), we set them as
-	 * 'installed' upon initalization. If/When the gtk/igtk callback is
+	 * 'installed' upon initialization. If/When the gtk/igtk callback is
 	 * called they will get set to false until we have received a successful
 	 * callback from nl80211. From these callbacks we can check that all
 	 * the keys have been installed, and only then trigger the handshake
@@ -294,7 +280,19 @@ const char *netdev_get_name(struct netdev *netdev)
 
 bool netdev_get_is_up(struct netdev *netdev)
 {
-	return (netdev->ifi_flags & IFF_UP) != 0;
+	bool powered = (netdev->ifi_flags & IFF_UP) != 0;
+
+	/*
+	 * If we are in the middle of changing the MAC we are in somewhat of a
+	 * no mans land. Technically the iface may be down, but since we are
+	 * not emitting any netdev DOWN events we want netdev_get_is_up to
+	 * reflect the same state. Once MAC changing finishes any pending
+	 * DOWN events will be emitted.
+	 */
+	if (netdev->mac_change_cmd_id && !powered)
+		return true;
+
+	return powered;
 }
 
 struct handshake_state *netdev_get_handshake(struct netdev *netdev)
@@ -349,7 +347,7 @@ int netdev_set_powered(struct netdev *netdev, bool powered,
 		return -EBUSY;
 
 	netdev->set_powered_cmd_id =
-		rtnl_set_powered(rtnl, netdev->index, powered,
+		l_rtnl_set_powered(rtnl, netdev->index, powered,
 					netdev_set_powered_result, netdev,
 					netdev_set_powered_destroy);
 	if (!netdev->set_powered_cmd_id)
@@ -622,11 +620,17 @@ static void netdev_free(void *data)
 		netdev->qos_map_cmd_id = 0;
 	}
 
+	if (netdev->mac_change_cmd_id) {
+		l_netlink_cancel(rtnl, netdev->mac_change_cmd_id);
+		netdev->mac_change_cmd_id = 0;
+	}
+
 	if (netdev->events_ready)
 		WATCHLIST_NOTIFY(&netdev_watches, netdev_watch_func_t,
 					netdev, NETDEV_WATCH_EVENT_DEL);
 
-	watchlist_destroy(&netdev->frame_watches);
+	scan_wdev_remove(netdev->wdev_id);
+
 	watchlist_destroy(&netdev->station_watches);
 
 	l_io_destroy(netdev->pae_io);
@@ -639,7 +643,8 @@ static void netdev_shutdown_one(void *data, void *user_data)
 	struct netdev *netdev = data;
 
 	if (netdev_get_is_up(netdev))
-		rtnl_set_powered(rtnl, netdev->index, false, NULL, NULL, NULL);
+		l_rtnl_set_powered(rtnl, netdev->index, false,
+					NULL, NULL, NULL);
 }
 
 static bool netdev_match(const void *a, const void *b)
@@ -673,7 +678,7 @@ static void netdev_cqm_event_rssi_threshold(struct netdev *netdev,
 {
 	int event;
 
-	if (!netdev->connected)
+	if (!netdev->operational)
 		return;
 
 	if (rssi_event != NL80211_CQM_RSSI_THRESHOLD_EVENT_LOW &&
@@ -962,8 +967,15 @@ static struct l_genl_msg *netdev_build_cmd_del_station(struct netdev *netdev,
 
 static void netdev_del_sta_cb(struct l_genl_msg *msg, void *user_data)
 {
-	if (l_genl_msg_get_error(msg) < 0)
-		l_error("DEL_STATION failed: %i", l_genl_msg_get_error(msg));
+	int err = l_genl_msg_get_error(msg);
+	const char *ext_error;
+
+	if (err >= 0)
+		return;
+
+	ext_error = l_genl_msg_get_extended_error(msg);
+	l_error("DEL_STATION failed: %s",
+			ext_error ? ext_error : strerror(-err));
 }
 
 int netdev_del_station(struct netdev *netdev, const uint8_t *sta,
@@ -993,7 +1005,7 @@ static void netdev_operstate_cb(int error, uint16_t type,
 
 static void netdev_connect_ok(struct netdev *netdev)
 {
-	rtnl_set_linkmode_and_operstate(rtnl, netdev->index,
+	l_rtnl_set_linkmode_and_operstate(rtnl, netdev->index,
 					IF_LINK_MODE_DORMANT, IF_OPER_UP,
 					netdev_operstate_cb,
 					L_UINT_TO_PTR(netdev->index), NULL);
@@ -1042,6 +1054,7 @@ static void netdev_setting_keys_failed(struct netdev_handshake_state *nhs,
 
 	switch (netdev->type) {
 	case NL80211_IFTYPE_STATION:
+	case NL80211_IFTYPE_P2P_CLIENT:
 		msg = netdev_build_cmd_disconnect(netdev,
 						MMPDU_REASON_CODE_UNSPECIFIED);
 		netdev->disconnect_cmd_id = l_genl_family_send(nl80211, msg,
@@ -1080,11 +1093,15 @@ static void netdev_set_station_cb(struct l_genl_msg *msg, void *user_data)
 		return;
 
 	err = l_genl_msg_get_error(msg);
-	if (err == -ENOTSUPP)
+	if (err == -EOPNOTSUPP || err == -ENOTSUPP)
 		goto done;
 
 	if (err < 0) {
-		l_error("Set Station failed for ifindex %d", netdev->index);
+		const char *ext_error = l_genl_msg_get_extended_error(msg);
+
+		l_error("Set Station failed for ifindex %d:%s", netdev->index,
+				ext_error ? ext_error : strerror(-err));
+
 		netdev_setting_keys_failed(nhs, err);
 		return;
 	}
@@ -1102,8 +1119,12 @@ static void netdev_new_group_key_cb(struct l_genl_msg *msg, void *data)
 	nhs->group_new_key_cmd_id = 0;
 
 	if (err < 0) {
-		l_error("New Key for Group Key failed for ifindex: %d",
-				netdev->index);
+		const char *ext_error = l_genl_msg_get_extended_error(msg);
+
+		l_error("New Key for Group Key failed for ifindex: %d:%s",
+				netdev->index,
+				ext_error ? ext_error : strerror(-err));
+
 		netdev_setting_keys_failed(nhs, err);
 		return;
 	}
@@ -1122,8 +1143,12 @@ static void netdev_new_group_management_key_cb(struct l_genl_msg *msg,
 	nhs->group_management_new_key_cmd_id = 0;
 
 	if (err < 0) {
-		l_error("New Key for Group Mgmt failed for ifindex: %d",
-				netdev->index);
+		const char *ext_error = l_genl_msg_get_extended_error(msg);
+
+		l_error("New Key for Group Mgmt failed for ifindex: %d:%s",
+				netdev->index,
+				ext_error ? ext_error : strerror(-err));
+
 		netdev_setting_keys_failed(nhs, err);
 		return;
 	}
@@ -1188,7 +1213,7 @@ static const uint8_t *netdev_choose_key_address(
 	return (nhs->super.authenticator) ? nhs->super.spa : nhs->super.aa;
 }
 
-static void netdev_set_gtk(struct handshake_state *hs, uint8_t key_index,
+static void netdev_set_gtk(struct handshake_state *hs, uint16_t key_index,
 				const uint8_t *gtk, uint8_t gtk_len,
 				const uint8_t *rsc, uint8_t rsc_len,
 				uint32_t cipher)
@@ -1235,7 +1260,7 @@ static void netdev_set_gtk(struct handshake_state *hs, uint8_t key_index,
 	netdev_setting_keys_failed(nhs, -EIO);
 }
 
-static void netdev_set_igtk(struct handshake_state *hs, uint8_t key_index,
+static void netdev_set_igtk(struct handshake_state *hs, uint16_t key_index,
 				const uint8_t *igtk, uint8_t igtk_len,
 				const uint8_t *ipn, uint8_t ipn_len,
 				uint32_t cipher)
@@ -1266,6 +1291,14 @@ static void netdev_set_igtk(struct handshake_state *hs, uint8_t key_index,
 		return;
 	}
 
+	if (key_index == 0x0400 || key_index == 0x0500) {
+		l_warn("Received an invalid IGTK key index (%04hx)"
+				" that is likely in"
+				" big endian format.  Trying to fix and"
+				" proceed anyway", key_index);
+		key_index = bswap_16(key_index);
+	}
+
 	msg = nl80211_build_new_key_group(netdev->index, cipher, key_index,
 					igtk_buf, igtk_len, ipn, ipn_len, NULL);
 
@@ -1291,8 +1324,11 @@ static void netdev_new_pairwise_key_cb(struct l_genl_msg *msg, void *data)
 	nhs->pairwise_new_key_cmd_id = 0;
 
 	if (err < 0) {
-		l_error("New Key for Pairwise Key failed for ifindex: %d",
-					netdev->index);
+		const char *ext_error = l_genl_msg_get_extended_error(msg);
+
+		l_error("New Key for Pairwise Key failed for ifindex: %d:%s",
+				netdev->index,
+				ext_error ? ext_error : strerror(-err));
 		goto error;
 	}
 
@@ -1528,11 +1564,16 @@ static void netdev_qos_map_cb(struct l_genl_msg *msg, void *user_data)
 {
 	struct netdev *netdev = user_data;
 	int err = l_genl_msg_get_error(msg);
-
-	if (err < 0)
-		l_error("Could not set QoS Map in kernel: %d", err);
+	const char *ext_error;
 
 	netdev->qos_map_cmd_id = 0;
+
+	if (err >= 0)
+		return;
+
+	ext_error = l_genl_msg_get_extended_error(msg);
+	l_error("Couuld not set QoS Map in kernel: %s",
+			ext_error ? ext_error : strerror(-err));
 }
 
 /*
@@ -1543,7 +1584,7 @@ static void netdev_qos_map_cb(struct l_genl_msg *msg, void *user_data)
  * to let the kernel know is to receive the IE, then give it right back...
  *
  * The kernel/driver/firmware *could* simply obtain this information as the
- * frame comes in and not require userspace to forward it back... but thats a
+ * frame comes in and not require userspace to forward it back... but that's a
  * battle for another day.
  */
 static void netdev_send_qos_map_set(struct netdev *netdev,
@@ -2062,6 +2103,8 @@ static void netdev_cmd_connect_cb(struct l_genl_msg *msg, void *user_data)
 
 	/* Wait for connect event */
 	if (l_genl_msg_get_error(msg) >= 0) {
+		netdev->connected = true;
+
 		if (netdev->event_filter)
 			netdev->event_filter(netdev,
 						NETDEV_EVENT_ASSOCIATING,
@@ -2086,8 +2129,7 @@ static void netdev_cmd_connect_cb(struct l_genl_msg *msg, void *user_data)
 }
 
 static struct l_genl_msg *netdev_build_cmd_authenticate(struct netdev *netdev,
-							uint32_t auth_type,
-							const uint8_t *addr)
+							uint32_t auth_type)
 {
 	struct handshake_state *hs = netdev->handshake;
 	struct l_genl_msg *msg;
@@ -2096,12 +2138,10 @@ static struct l_genl_msg *netdev_build_cmd_authenticate(struct netdev *netdev,
 	l_genl_msg_append_attr(msg, NL80211_ATTR_IFINDEX, 4, &netdev->index);
 	l_genl_msg_append_attr(msg, NL80211_ATTR_WIPHY_FREQ,
 						4, &netdev->frequency);
-	l_genl_msg_append_attr(msg, NL80211_ATTR_MAC, ETH_ALEN, addr);
+	l_genl_msg_append_attr(msg, NL80211_ATTR_MAC, ETH_ALEN,
+				netdev->handshake->aa);
 	l_genl_msg_append_attr(msg, NL80211_ATTR_SSID, hs->ssid_len, hs->ssid);
 	l_genl_msg_append_attr(msg, NL80211_ATTR_AUTH_TYPE, 4, &auth_type);
-
-	l_genl_msg_append_attr(msg, NL80211_ATTR_IE, hs->supplicant_ie[1] + 2,
-					hs->supplicant_ie);
 
 	return msg;
 }
@@ -2138,8 +2178,7 @@ static void netdev_sae_tx_authenticate(const uint8_t *body,
 	struct netdev *netdev = user_data;
 	struct l_genl_msg *msg;
 
-	msg = netdev_build_cmd_authenticate(netdev, NL80211_AUTHTYPE_SAE,
-						netdev->handshake->aa);
+	msg = netdev_build_cmd_authenticate(netdev, NL80211_AUTHTYPE_SAE);
 
 	l_genl_msg_append_attr(msg, NL80211_ATTR_AUTH_DATA, body_len, body);
 
@@ -2185,8 +2224,7 @@ static void netdev_owe_tx_authenticate(void *user_data)
 	struct l_genl_msg *msg;
 
 	msg = netdev_build_cmd_authenticate(netdev,
-						NL80211_AUTHTYPE_OPEN_SYSTEM,
-						netdev->handshake->aa);
+						NL80211_AUTHTYPE_OPEN_SYSTEM);
 
 	if (!l_genl_family_send(nl80211, msg, netdev_auth_cb,
 							netdev, NULL)) {
@@ -2222,8 +2260,7 @@ static void netdev_fils_tx_authenticate(const uint8_t *body,
 	struct netdev *netdev = user_data;
 	struct l_genl_msg *msg;
 
-	msg = netdev_build_cmd_authenticate(netdev, NL80211_AUTHTYPE_FILS_SK,
-						netdev->handshake->aa);
+	msg = netdev_build_cmd_authenticate(netdev, NL80211_AUTHTYPE_FILS_SK);
 
 	l_genl_msg_append_attr(msg, NL80211_ATTR_AUTH_DATA, body_len, body);
 
@@ -2382,13 +2419,15 @@ static struct l_genl_msg *netdev_build_cmd_connect(struct netdev *netdev,
 	return msg;
 }
 
-static int netdev_connect_common(struct netdev *netdev,
-					struct l_genl_msg *cmd_connect,
-					struct scan_bss *bss,
-					struct handshake_state *hs,
-					struct eapol_sm *sm,
-					netdev_event_func_t event_filter,
-					netdev_connect_cb_t cb, void *user_data)
+struct rtnl_data {
+	struct netdev *netdev;
+	struct l_genl_msg *cmd_connect;
+	uint8_t addr[ETH_ALEN];
+	int ref;
+};
+
+static int netdev_begin_connection(struct netdev *netdev,
+					struct l_genl_msg *cmd_connect)
 {
 	if (cmd_connect) {
 		netdev->connect_cmd_id = l_genl_family_send(nl80211,
@@ -2401,27 +2440,216 @@ static int netdev_connect_common(struct netdev *netdev,
 		}
 	}
 
+	handshake_state_set_supplicant_address(netdev->handshake, netdev->addr);
+
+	/* set connected since the auth protocols cannot do so internally */
+	if (netdev->ap && auth_proto_start(netdev->ap))
+		netdev->connected = true;
+
+	return 0;
+}
+
+static void netdev_mac_change_failed(struct netdev *netdev,
+					struct rtnl_data *req, int error)
+{
+	l_error("Error setting mac address on %d: %s", netdev->index,
+			strerror(-error));
+
+	/*
+	 * If the interface is down and we failed to up it we need to notify
+	 * any watchers since we have been skipping the notification while
+	 * mac_change_cmd_id was set.
+	 */
+	if (!netdev_get_is_up(netdev)) {
+		l_genl_msg_unref(req->cmd_connect);
+
+		WATCHLIST_NOTIFY(&netdev_watches, netdev_watch_func_t,
+				netdev, NETDEV_WATCH_EVENT_DOWN);
+
+		goto failed;
+	} else {
+		/*
+		 * If the interface is up we can still try and connect. This
+		 * is a very rare case and most likely will never happen.
+		 */
+		l_info("Interface still up after failing to change the MAC, "
+			"continuing with connection");
+		if (netdev_begin_connection(netdev, req->cmd_connect) < 0)
+			goto failed;
+
+		return;
+	}
+
+failed:
+	netdev_connect_failed(netdev, NETDEV_RESULT_ABORTED,
+				MMPDU_STATUS_CODE_UNSPECIFIED);
+}
+
+static void netdev_mac_destroy(void *user_data)
+{
+	struct rtnl_data *req = user_data;
+
+	req->ref--;
+
+	/* still pending requests? */
+	if (req->ref)
+		return;
+
+	l_free(req);
+}
+
+static void netdev_mac_power_up_cb(int error, uint16_t type,
+					const void *data, uint32_t len,
+					void *user_data)
+{
+	struct rtnl_data *req = user_data;
+	struct netdev *netdev = req->netdev;
+
+	netdev->mac_change_cmd_id = 0;
+
+	if (error) {
+		l_error("Error taking interface %u up for per-network MAC "
+			"generation: %s", netdev->index, strerror(-error));
+		netdev_mac_change_failed(netdev, req, error);
+		return;
+	}
+
+	/*
+	 * Pick up where we left off in netdev_connect_commmon.
+	 */
+	if (netdev_begin_connection(netdev, req->cmd_connect) < 0) {
+		l_error("Failed to connect after changing MAC");
+		netdev_connect_failed(netdev, NETDEV_RESULT_ASSOCIATION_FAILED,
+				MMPDU_STATUS_CODE_UNSPECIFIED);
+	}
+}
+
+static void netdev_mac_power_down_cb(int error, uint16_t type,
+					const void *data, uint32_t len,
+					void *user_data)
+{
+	struct rtnl_data *req = user_data;
+	struct netdev *netdev = req->netdev;
+
+	netdev->mac_change_cmd_id = 0;
+
+	if (error) {
+		l_error("Error taking interface %u down for per-network MAC "
+			"generation: %s", netdev->index, strerror(-error));
+		netdev_mac_change_failed(netdev, req, error);
+		return;
+	}
+
+	l_debug("Setting generated address on ifindex: %d to: "MAC,
+					netdev->index, MAC_STR(req->addr));
+	netdev->mac_change_cmd_id = l_rtnl_set_mac(rtnl, netdev->index,
+					req->addr, true,
+					netdev_mac_power_up_cb, req,
+					netdev_mac_destroy);
+	if (!netdev->mac_change_cmd_id) {
+		netdev_mac_change_failed(netdev, req, -EIO);
+		return;
+	}
+
+	req->ref++;
+}
+
+/*
+ * TODO: There are some potential race conditions that are being ignored. There
+ *       is nothing that IWD itself can do to solve these, they require kernel
+ *       changes:
+ *
+ * 1. A perfectly timed ifdown could be ignored. If an external process
+ *    brings down an interface just before calling this function we would only
+ *    get a single newlink event since there is no state change doing a second
+ *    ifdown (nor an error from the kernel). This newlink event would be ignored
+ *    since IWD thinks its from our own doing. This would result in IWD changing
+ *    the MAC and bringing the interface back up which would look very strange
+ *    and unexpected to someone who just tried to ifdown an interface.
+ *
+ * 2. A perfectly timed ifup could result in a failed connection. If an external
+ *    process ifup's just after IWD ifdown's but before changing the MAC this
+ *    would cause the MAC change to fail. This failure would result in a failed
+ *    connection.
+ *
+ * Returns 0 if a MAC change procedure was started.
+ * Returns -EALREADY if the requested MAC matched our current MAC
+ * Returns -EIO if there was an IO error when powering down
+ */
+static int netdev_start_powered_mac_change(struct netdev *netdev,
+					struct scan_bss *bss,
+					struct l_genl_msg *cmd_connect)
+{
+	struct rtnl_data *req;
+	uint8_t new_addr[6];
+
+	/* No address set in handshake, use per-network MAC generation */
+	if (util_mem_is_zero(netdev->handshake->spa, ETH_ALEN))
+		wiphy_generate_address_from_ssid(netdev->wiphy,
+						(const char *)bss->ssid,
+						new_addr);
+	else
+		memcpy(new_addr, netdev->handshake->spa, ETH_ALEN);
+
+	/*
+	 * MAC has already been changed previously, no need to again
+	 */
+	if (!memcmp(new_addr, netdev->addr, sizeof(new_addr)))
+		return -EALREADY;
+
+	req = l_new(struct rtnl_data, 1);
+	req->netdev = netdev;
+	/* This message will need to be unreffed upon any error */
+	req->cmd_connect = cmd_connect;
+	req->ref++;
+	memcpy(req->addr, new_addr, sizeof(req->addr));
+
+	netdev->mac_change_cmd_id = l_rtnl_set_powered(rtnl, netdev->index,
+					false, netdev_mac_power_down_cb,
+					req, netdev_mac_destroy);
+
+	if (!netdev->mac_change_cmd_id) {
+		l_genl_msg_unref(req->cmd_connect);
+		l_free(req);
+
+		return -EIO;
+	}
+
+	return 0;
+}
+
+static int netdev_connect_common(struct netdev *netdev,
+					struct l_genl_msg *cmd_connect,
+					struct scan_bss *bss,
+					struct handshake_state *hs,
+					struct eapol_sm *sm,
+					netdev_event_func_t event_filter,
+					netdev_connect_cb_t cb, void *user_data)
+{
 	netdev->event_filter = event_filter;
 	netdev->connect_cb = cb;
 	netdev->user_data = user_data;
-	netdev->connected = true;
 	netdev->handshake = hs;
 	netdev->sm = sm;
 	netdev->frequency = bss->frequency;
-	netdev->cur_rssi_low = false; /* Gets udpated on the 1st CQM event */
+	netdev->cur_rssi_low = false; /* Gets updated on the 1st CQM event */
 	netdev->cur_rssi = bss->signal_strength / 100;
 	netdev_rssi_level_init(netdev);
 
 	handshake_state_set_authenticator_address(hs, bss->addr);
-	handshake_state_set_supplicant_address(hs, netdev->addr);
 
 	if (!wiphy_has_ext_feature(netdev->wiphy,
 					NL80211_EXT_FEATURE_CAN_REPLACE_PTK0))
 		handshake_state_set_no_rekey(hs, true);
 
-	auth_proto_start(netdev->ap);
+	if (mac_per_ssid) {
+		int ret = netdev_start_powered_mac_change(netdev, bss,
+								cmd_connect);
+		if (ret != -EALREADY)
+			return ret;
+	}
 
-	return 0;
+	return netdev_begin_connection(netdev, cmd_connect);
 }
 
 int netdev_connect(struct netdev *netdev, struct scan_bss *bss,
@@ -2439,7 +2667,7 @@ int netdev_connect(struct netdev *netdev, struct scan_bss *bss,
 			netdev->type != NL80211_IFTYPE_P2P_CLIENT)
 		return -ENOTSUP;
 
-	if (netdev->connected)
+	if (netdev->connected || netdev->connect_cmd_id)
 		return -EISCONN;
 
 	switch (hs->akm_suite) {
@@ -2707,30 +2935,6 @@ static uint32_t netdev_send_action_frame(struct netdev *netdev,
 	return netdev_send_action_framev(netdev, to, iov, 1, freq, callback);
 }
 
-/*
- * Build an FT Authentication Request frame according to 12.5.2 / 12.5.4:
- * RSN or non-RSN Over-the-air FT Protocol, with the IE contents
- * according to 12.8.2: FT authentication sequence: contents of first message.
- */
-static struct l_genl_msg *netdev_build_cmd_ft_authenticate(
-					struct netdev *netdev,
-					const struct handshake_state *hs)
-{
-	uint32_t auth_type = NL80211_AUTHTYPE_FT;
-	struct l_genl_msg *msg;
-
-	msg = l_genl_msg_new_sized(NL80211_CMD_AUTHENTICATE, 512);
-	l_genl_msg_append_attr(msg, NL80211_ATTR_IFINDEX, 4, &netdev->index);
-	l_genl_msg_append_attr(msg, NL80211_ATTR_WIPHY_FREQ,
-						4, &netdev->frequency);
-	l_genl_msg_append_attr(msg, NL80211_ATTR_MAC, ETH_ALEN, hs->aa);
-	l_genl_msg_append_attr(msg, NL80211_ATTR_SSID, hs->ssid_len, hs->ssid);
-	l_genl_msg_append_attr(msg, NL80211_ATTR_AUTH_TYPE, 4, &auth_type);
-
-	return msg;
-
-}
-
 static void netdev_cmd_authenticate_ft_cb(struct l_genl_msg *msg,
 						void *user_data)
 {
@@ -2750,8 +2954,8 @@ static void netdev_ft_tx_authenticate(struct iovec *iov,
 	struct netdev *netdev = user_data;
 	struct l_genl_msg *cmd_authenticate;
 
-	cmd_authenticate = netdev_build_cmd_ft_authenticate(netdev,
-							netdev->handshake);
+	cmd_authenticate = netdev_build_cmd_authenticate(netdev,
+							NL80211_AUTHTYPE_FT);
 	if (!cmd_authenticate)
 		goto restore_snonce;
 
@@ -2812,13 +3016,13 @@ static void netdev_ft_request_cb(struct l_genl_msg *msg, void *user_data)
 	}
 }
 
-static void netdev_ft_response_frame_event(struct netdev *netdev,
-					const struct mmpdu_header *hdr,
+static void netdev_ft_response_frame_event(const struct mmpdu_header *hdr,
 					const void *body, size_t body_len,
-					void *user_data)
+					int rssi, void *user_data)
 {
 	int ret;
 	uint16_t status_code = MMPDU_STATUS_CODE_UNSPECIFIED;
+	struct netdev *netdev = user_data;
 
 	if (!netdev->ap || !netdev->in_ft)
 		return;
@@ -2839,11 +3043,12 @@ ft_error:
 	return;
 }
 
-static void netdev_qos_map_frame_event(struct netdev *netdev,
-					const struct mmpdu_header *hdr,
+static void netdev_qos_map_frame_event(const struct mmpdu_header *hdr,
 					const void *body, size_t body_len,
-					void *user_data)
+					int rssi, void *user_data)
 {
+	struct netdev *netdev = user_data;
+
 	/* No point telling the kernel */
 	if (!netdev->connected)
 		return;
@@ -3088,11 +3293,12 @@ int netdev_neighbor_report_req(struct netdev *netdev,
 	return 0;
 }
 
-static void netdev_neighbor_report_frame_event(struct netdev *netdev,
-					const struct mmpdu_header *hdr,
+static void netdev_neighbor_report_frame_event(const struct mmpdu_header *hdr,
 					const void *body, size_t body_len,
-					void *user_data)
+					int rssi, void *user_data)
 {
+	struct netdev *netdev = user_data;
+
 	if (body_len < 3) {
 		l_debug("Neighbor Report frame too short");
 		return;
@@ -3116,20 +3322,26 @@ static void netdev_neighbor_report_frame_event(struct netdev *netdev,
 	l_timeout_remove(netdev->neighbor_report_timeout);
 }
 
-static void netdev_sa_query_resp_cb(struct l_genl_msg *msg,
-		void *user_data)
+static void netdev_sa_query_resp_cb(struct l_genl_msg *msg, void *user_data)
 {
-	if (l_genl_msg_get_error(msg) < 0)
-		l_debug("error sending SA Query request");
+	int err = l_genl_msg_get_error(msg);
+	const char *ext_error;
+
+	if (err >= 0)
+		return;
+
+	ext_error = l_genl_msg_get_extended_error(msg);
+	l_debug("error sending SA Query request: %s",
+			ext_error ? ext_error : strerror(-err));
 }
 
-static void netdev_sa_query_req_frame_event(struct netdev *netdev,
-		const struct mmpdu_header *hdr,
-		const void *body, size_t body_len,
-		void *user_data)
+static void netdev_sa_query_req_frame_event(const struct mmpdu_header *hdr,
+					const void *body, size_t body_len,
+					int rssi, void *user_data)
 {
 	uint8_t sa_resp[4];
 	uint16_t transaction;
+	struct netdev *netdev = user_data;
 
 	if (body_len < 4) {
 		l_debug("SA Query request too short");
@@ -3161,11 +3373,12 @@ static void netdev_sa_query_req_frame_event(struct netdev *netdev,
 	}
 }
 
-static void netdev_sa_query_resp_frame_event(struct netdev *netdev,
-		const struct mmpdu_header *hdr,
-		const void *body, size_t body_len,
-		void *user_data)
+static void netdev_sa_query_resp_frame_event(const struct mmpdu_header *hdr,
+					const void *body, size_t body_len,
+					int rssi, void *user_data)
 {
+	struct netdev *netdev = user_data;
+
 	if (body_len < 4) {
 		l_debug("SA Query frame too short");
 		return;
@@ -3198,17 +3411,21 @@ static void netdev_sa_query_resp_frame_event(struct netdev *netdev,
 	netdev->sa_query_timeout = NULL;
 }
 
-static void netdev_sa_query_req_cb(struct l_genl_msg *msg,
-		void *user_data)
+static void netdev_sa_query_req_cb(struct l_genl_msg *msg, void *user_data)
 {
 	struct netdev *netdev = user_data;
+	int err = l_genl_msg_get_error(msg);
+	const char *ext_error;
 
-	if (l_genl_msg_get_error(msg) < 0) {
-		l_debug("error sending SA Query request");
+	if (err >= 0)
+		return;
 
-		l_timeout_remove(netdev->sa_query_timeout);
-		netdev->sa_query_timeout = NULL;
-	}
+	ext_error = l_genl_msg_get_extended_error(msg);
+	l_debug("error sending SA Query request: %s",
+			ext_error ? ext_error : strerror(-err));
+
+	l_timeout_remove(netdev->sa_query_timeout);
+	netdev->sa_query_timeout = NULL;
 }
 
 static void netdev_sa_query_timeout(struct l_timeout *timeout,
@@ -3398,74 +3615,6 @@ static void netdev_mlme_notify(struct l_genl_msg *msg, void *user_data)
 	}
 }
 
-struct frame_prefix_info {
-	uint16_t frame_type;
-	const uint8_t *body;
-	size_t body_len;
-};
-
-static bool netdev_frame_watch_match_prefix(const void *a, const void *b)
-{
-	const struct watchlist_item *item = a;
-	const struct netdev_frame_watch *fw =
-		l_container_of(item, struct netdev_frame_watch, super);
-	const struct frame_prefix_info *info = b;
-
-	return fw->frame_type == info->frame_type &&
-		fw->prefix_len <= info->body_len &&
-		(fw->prefix_len == 0 ||
-		 !memcmp(fw->prefix, info->body, fw->prefix_len));
-}
-
-static void netdev_mgmt_frame_event(struct l_genl_msg *msg,
-					struct netdev *netdev)
-{
-	struct l_genl_attr attr;
-	uint16_t type, len, frame_len;
-	const void *data;
-	const struct mmpdu_header *mpdu = NULL;
-	const uint8_t *body;
-	struct frame_prefix_info info;
-
-	if (!l_genl_attr_init(&attr, msg))
-		return;
-
-	while (l_genl_attr_next(&attr, &type, &len, &data)) {
-		switch (type) {
-		case NL80211_ATTR_FRAME:
-			if (mpdu)
-				return;
-
-			mpdu = mpdu_validate(data, len);
-			if (!mpdu)
-				l_error("Frame didn't validate as MMPDU");
-
-			frame_len = len;
-			break;
-		}
-	}
-
-	if (!mpdu)
-		return;
-
-	body = mmpdu_body(mpdu);
-
-	if (memcmp(mpdu->address_1, netdev->addr, 6) &&
-			!util_is_broadcast_address(mpdu->address_1))
-		return;
-
-	/* Only match the frame type and subtype like the kernel does */
-#define FC_FTYPE_STYPE_MASK 0x00fc
-	info.frame_type = l_get_le16(mpdu) & FC_FTYPE_STYPE_MASK;
-	info.body = (const uint8_t *) body;
-	info.body_len = (const uint8_t *) mpdu + frame_len - body;
-
-	WATCHLIST_NOTIFY_MATCHES(&netdev->frame_watches,
-					netdev_frame_watch_match_prefix, &info,
-					netdev_frame_watch_func_t,
-					netdev, mpdu, body, info.body_len);
-}
-
 static void netdev_pae_destroy(void *user_data)
 {
 	struct netdev *netdev = user_data;
@@ -3580,14 +3729,15 @@ static struct l_genl_msg *netdev_build_control_port_frame(struct netdev *netdev,
 static void netdev_control_port_frame_cb(struct l_genl_msg *msg,
 							void *user_data)
 {
-	int err;
+	int err = l_genl_msg_get_error(msg);
+	const char *ext_error;
 
-	err = l_genl_msg_get_error(msg);
+	if (err >= 0)
+		return;
 
-	l_debug("%d", err);
-
-	if (err < 0)
-		l_info("CMD_CONTROL_PORT failed: %s", strerror(-err));
+	ext_error = l_genl_msg_get_extended_error(msg);
+	l_error("CMD_CONTROL_PORT failed: %s",
+			ext_error ? ext_error : strerror(-err));
 }
 
 static int netdev_control_port_write_pae(struct netdev *netdev,
@@ -3686,9 +3836,6 @@ static void netdev_unicast_notify(struct l_genl_msg *msg, void *user_data)
 		return;
 
 	switch (cmd) {
-	case NL80211_CMD_FRAME:
-		netdev_mgmt_frame_event(msg, netdev);
-		break;
 	case NL80211_CMD_CONTROL_PORT_FRAME:
 		netdev_control_port_frame_event(msg, netdev);
 		break;
@@ -3752,12 +3899,15 @@ static struct l_genl_msg *netdev_build_cmd_cqm_rssi_update(
 
 static void netdev_cmd_set_cqm_cb(struct l_genl_msg *msg, void *user_data)
 {
-	int r = l_genl_msg_get_error(msg);
+	int err = l_genl_msg_get_error(msg);
+	const char *ext_error;
 
-	if (!r)
+	if (err >= 0)
 		return;
 
-	l_error("CMD_SET_CQM failed: %d(%s)", r, strerror(-r));
+	ext_error = l_genl_msg_get_extended_error(msg);
+	l_error("CMD_SET_CQM failed: %s",
+			ext_error ? ext_error : strerror(-err));
 }
 
 int netdev_set_rssi_report_levels(struct netdev *netdev, const int8_t *levels,
@@ -3892,7 +4042,7 @@ static void netdev_set_iftype_cb(struct l_genl_msg *msg, void *user_data)
 		goto done;
 
 	netdev->set_powered_cmd_id =
-			rtnl_set_powered(rtnl, netdev->index, true,
+			l_rtnl_set_powered(rtnl, netdev->index, true,
 					netdev_set_iftype_up_cb, req,
 					netdev_set_iftype_request_destroy);
 	if (!netdev->set_powered_cmd_id) {
@@ -3988,7 +4138,7 @@ int netdev_set_iftype(struct netdev *netdev, enum netdev_iftype type,
 		l_genl_msg_unref(msg);
 	} else {
 		netdev->set_powered_cmd_id =
-			rtnl_set_powered(rtnl, netdev->index, false,
+			l_rtnl_set_powered(rtnl, netdev->index, false,
 					netdev_set_iftype_down_cb, req,
 					netdev_set_iftype_request_destroy);
 		if (netdev->set_powered_cmd_id)
@@ -4143,7 +4293,14 @@ static void netdev_newlink_notify(const struct ifinfomsg *ifi, int bytes)
 
 	new_up = netdev_get_is_up(netdev);
 
-	if (old_up != new_up)
+	/*
+	 * If mac_change_cmd_id is set we are in the process of changing the
+	 * MAC address and this event is a result of powering down/up. In this
+	 * case we do not want to emit a netdev DOWN/UP event as this would
+	 * cause other modules to behave as such. We do, however, want to emit
+	 * address changes so other modules get the new MAC address updated.
+	 */
+	if (old_up != new_up && !netdev->mac_change_cmd_id)
 		WATCHLIST_NOTIFY(&netdev_watches, netdev_watch_func_t,
 				netdev, new_up ? NETDEV_WATCH_EVENT_UP :
 						NETDEV_WATCH_EVENT_DOWN);
@@ -4191,7 +4348,7 @@ static void netdev_initial_up_cb(int error, uint16_t type, const void *data,
 			return;
 	}
 
-	rtnl_set_linkmode_and_operstate(rtnl, netdev->index,
+	l_rtnl_set_linkmode_and_operstate(rtnl, netdev->index,
 					IF_LINK_MODE_DORMANT, IF_OPER_DOWN,
 					netdev_operstate_cb,
 					L_UINT_TO_PTR(netdev->index), NULL);
@@ -4204,23 +4361,25 @@ static void netdev_initial_up_cb(int error, uint16_t type, const void *data,
 
 	l_debug("Interface %i initialized", netdev->index);
 
+	scan_wdev_add(netdev->wdev_id);
+
 	WATCHLIST_NOTIFY(&netdev_watches, netdev_watch_func_t,
 				netdev, NETDEV_WATCH_EVENT_NEW);
 	netdev->events_ready = true;
 }
 
-static void netdev_set_mac_cb(int error, uint16_t type, const void *data,
-					uint32_t len, void *user_data)
+static bool netdev_check_set_mac(struct netdev *netdev)
 {
-	struct netdev *netdev = user_data;
+	if (util_mem_is_zero(netdev->set_mac_once, 6))
+		return false;
 
-	if (error)
-		l_error("Error setting mac address on %d: %s", netdev->index,
-			strerror(-error));
-
+	l_debug("Setting initial address on ifindex: %d to: " MAC,
+		netdev->index, MAC_STR(netdev->set_mac_once));
 	netdev->set_powered_cmd_id =
-		rtnl_set_powered(rtnl, netdev->index, true,
-					netdev_initial_up_cb, netdev, NULL);
+		l_rtnl_set_mac(rtnl, netdev->index, netdev->set_mac_once, true,
+				netdev_initial_up_cb, netdev, NULL);
+	memset(netdev->set_mac_once, 0, 6);
+	return true;
 }
 
 static void netdev_initial_down_cb(int error, uint16_t type, const void *data,
@@ -4238,20 +4397,11 @@ static void netdev_initial_down_cb(int error, uint16_t type, const void *data,
 		return;
 	}
 
-	if (netdev->mac_randomize_once) {
-		uint8_t addr[ETH_ALEN];
-
-		wiphy_generate_random_address(netdev->wiphy, addr);
-		l_debug("Setting initial random address on "
-			"ifindex: %d to: "MAC, netdev->index, MAC_STR(addr));
-		netdev->set_powered_cmd_id =
-			rtnl_set_mac(rtnl, netdev->index, addr,
-					netdev_set_mac_cb, netdev, NULL);
+	if (netdev_check_set_mac(netdev))
 		return;
-	}
 
 	netdev->set_powered_cmd_id =
-		rtnl_set_powered(rtnl, netdev->index, true,
+		l_rtnl_set_powered(rtnl, netdev->index, true,
 					netdev_initial_up_cb, netdev, NULL);
 }
 
@@ -4290,91 +4440,14 @@ static void netdev_getlink_cb(int error, uint16_t type, const void *data,
 	 */
 	powered = netdev_get_is_up(netdev);
 
-	if (!powered && netdev->mac_randomize_once) {
-		uint8_t addr[ETH_ALEN];
-
-		wiphy_generate_random_address(netdev->wiphy, addr);
-		l_debug("Setting initial random address on "
-			"ifindex: %d to: "MAC, netdev->index, MAC_STR(addr));
-		netdev->set_powered_cmd_id =
-			rtnl_set_mac(rtnl, netdev->index, addr,
-					netdev_set_mac_cb, netdev, NULL);
+	if (!powered && netdev_check_set_mac(netdev))
 		return;
-	}
 
 	cb = powered ? netdev_initial_down_cb : netdev_initial_up_cb;
 
 	netdev->set_powered_cmd_id =
-		rtnl_set_powered(rtnl, ifi->ifi_index, !powered, cb, netdev,
+		l_rtnl_set_powered(rtnl, ifi->ifi_index, !powered, cb, netdev,
 					NULL);
-}
-
-static void netdev_frame_watch_free(struct watchlist_item *item)
-{
-	struct netdev_frame_watch *fw =
-		l_container_of(item, struct netdev_frame_watch, super);
-
-	l_free(fw->prefix);
-	l_free(fw);
-}
-
-static const struct watchlist_ops netdev_frame_watch_ops = {
-	.item_free = netdev_frame_watch_free,
-};
-
-static void netdev_frame_cb(struct l_genl_msg *msg, void *user_data)
-{
-	if (l_genl_msg_get_error(msg) < 0)
-		l_error("Could not register frame watch type %04x: %i",
-			L_PTR_TO_UINT(user_data), l_genl_msg_get_error(msg));
-}
-
-uint32_t netdev_frame_watch_add(struct netdev *netdev, uint16_t frame_type,
-				const uint8_t *prefix, size_t prefix_len,
-				netdev_frame_watch_func_t handler,
-				void *user_data)
-{
-	struct netdev_frame_watch *fw;
-	struct l_genl_msg *msg;
-	struct frame_prefix_info info = { frame_type, prefix, prefix_len };
-	bool registered;
-	uint32_t id;
-
-	registered = l_queue_find(netdev->frame_watches.items,
-					netdev_frame_watch_match_prefix,
-					&info);
-
-	fw = l_new(struct netdev_frame_watch, 1);
-	fw->frame_type = frame_type;
-	fw->prefix = prefix_len ? l_memdup(prefix, prefix_len) : NULL;
-	fw->prefix_len = prefix_len;
-	id = watchlist_link(&netdev->frame_watches, &fw->super,
-						handler, user_data, NULL);
-
-	if (registered)
-		return id;
-
-	msg = l_genl_msg_new_sized(NL80211_CMD_REGISTER_FRAME, 32 + prefix_len);
-
-	l_genl_msg_append_attr(msg, NL80211_ATTR_IFINDEX, 4, &netdev->index);
-	l_genl_msg_append_attr(msg, NL80211_ATTR_FRAME_TYPE, 2, &frame_type);
-	l_genl_msg_append_attr(msg, NL80211_ATTR_FRAME_MATCH,
-				prefix_len, prefix);
-
-	l_genl_family_send(nl80211, msg, netdev_frame_cb,
-			L_UINT_TO_PTR(frame_type), NULL);
-
-	return id;
-}
-
-bool netdev_frame_watch_remove(struct netdev *netdev, uint32_t id)
-{
-	/*
-	 * There's no way to unregister from notifications but that's not a
-	 * problem, we leave them active in the kernel but
-	 * netdev_mgmt_frame_event will ignore these events.
-	 */
-	return watchlist_remove(&netdev->frame_watches, id);
 }
 
 static struct l_io *pae_open(uint32_t ifindex)
@@ -4431,16 +4504,15 @@ error:
 	return NULL;
 }
 
-struct netdev *netdev_create_from_genl(struct l_genl_msg *msg, bool random_mac)
+struct netdev *netdev_create_from_genl(struct l_genl_msg *msg,
+					const uint8_t *set_mac)
 {
-	struct l_genl_attr attr;
-	uint16_t type, len;
-	const void *data;
-	const char *ifname = NULL;
-	uint16_t ifname_len = 0;
-	const uint8_t *ifaddr = NULL;
-	const uint32_t *ifindex = NULL, *iftype = NULL;
-	const uint64_t *wdev = NULL;
+	const char *ifname;
+	const uint8_t *ifaddr;
+	uint32_t ifindex;
+	uint32_t iftype;
+	uint64_t wdev;
+	uint32_t wiphy_id;
 	struct netdev *netdev;
 	struct wiphy *wiphy = NULL;
 	struct ifinfomsg *rtmmsg;
@@ -4452,87 +4524,32 @@ struct netdev *netdev_create_from_genl(struct l_genl_msg *msg, bool random_mac)
 	const uint8_t action_qos_map_prefix[] = { 0x01, 0x04 };
 	struct l_io *pae_io = NULL;
 
-	if (!l_genl_attr_init(&attr, msg))
-		return NULL;
-
-	while (l_genl_attr_next(&attr, &type, &len, &data)) {
-		switch (type) {
-		case NL80211_ATTR_IFINDEX:
-			if (len != sizeof(uint32_t)) {
-				l_warn("Invalid interface index attribute");
-				return NULL;
-			}
-
-			ifindex = data;
-			break;
-
-		case NL80211_ATTR_WDEV:
-			if (len != sizeof(uint64_t)) {
-				l_warn("Invalid wdev attribute");
-				return NULL;
-			}
-
-			wdev = data;
-			break;
-
-		case NL80211_ATTR_IFNAME:
-			if (len > IFNAMSIZ) {
-				l_warn("Invalid interface name attribute");
-				return NULL;
-			}
-
-			ifname = data;
-			ifname_len = len;
-			break;
-
-		case NL80211_ATTR_WIPHY:
-			if (len != sizeof(uint32_t)) {
-				l_warn("Invalid wiphy attribute");
-				return NULL;
-			}
-
-			wiphy = wiphy_find(*((uint32_t *) data));
-			break;
-
-		case NL80211_ATTR_IFTYPE:
-			if (len != sizeof(uint32_t)) {
-				l_warn("Invalid interface type attribute");
-				return NULL;
-			}
-
-			iftype = data;
-			break;
-
-		case NL80211_ATTR_MAC:
-			if (len != ETH_ALEN) {
-				l_warn("Invalid interface address attribute");
-				return NULL;
-			}
-
-			ifaddr = data;
-			break;
-		}
-	}
-
-	if (!iftype) {
-		l_warn("Missing iftype attribute");
+	if (nl80211_parse_attrs(msg, NL80211_ATTR_IFINDEX, &ifindex,
+					NL80211_ATTR_WDEV, &wdev,
+					NL80211_ATTR_IFNAME, &ifname,
+					NL80211_ATTR_WIPHY, &wiphy_id,
+					NL80211_ATTR_IFTYPE, &iftype,
+					NL80211_ATTR_MAC, &ifaddr,
+					NL80211_ATTR_UNSPEC) < 0) {
+		l_warn("Required attributes missing");
 		return NULL;
 	}
 
-	if (!wiphy || !ifindex || !wdev || !ifaddr || !ifname) {
-		l_warn("Unable to parse interface information");
+	wiphy = wiphy_find(wiphy_id);
+	if (!wiphy) {
+		l_warn("No wiphy: %d", wiphy_id);
 		return NULL;
 	}
 
-	if (netdev_find(*ifindex)) {
-		l_debug("Skipping duplicate netdev %s[%d]", ifname, *ifindex);
+	if (netdev_find(ifindex)) {
+		l_debug("Skipping duplicate netdev %s[%d]", ifname, ifindex);
 		return NULL;
 	}
 
 	if (!wiphy_has_ext_feature(wiphy,
 			NL80211_EXT_FEATURE_CONTROL_PORT_OVER_NL80211) ||
 			!pae_over_nl80211) {
-		pae_io = pae_open(*ifindex);
+		pae_io = pae_open(ifindex);
 		if (!pae_io) {
 			l_error("Unable to open PAE interface");
 			return NULL;
@@ -4540,15 +4557,17 @@ struct netdev *netdev_create_from_genl(struct l_genl_msg *msg, bool random_mac)
 	}
 
 	netdev = l_new(struct netdev, 1);
-	netdev->index = *ifindex;
-	netdev->wdev_id = *wdev;
-	netdev->type = *iftype;
+	netdev->index = ifindex;
+	netdev->wdev_id = wdev;
+	netdev->type = iftype;
 	netdev->rekey_offload_support = true;
 	memcpy(netdev->addr, ifaddr, sizeof(netdev->addr));
-	memcpy(netdev->name, ifname, ifname_len);
+	l_strlcpy(netdev->name, ifname, IFNAMSIZ);
 	netdev->wiphy = wiphy;
 	netdev->pae_over_nl80211 = pae_io == NULL;
-	netdev->mac_randomize_once = random_mac;
+
+	if (set_mac)
+		memcpy(netdev->set_mac_once, set_mac, 6);
 
 	if (pae_io) {
 		netdev->pae_io = pae_io;
@@ -4556,7 +4575,6 @@ struct netdev *netdev_create_from_genl(struct l_genl_msg *msg, bool random_mac)
 							netdev_pae_destroy);
 	}
 
-	watchlist_init(&netdev->frame_watches, &netdev_frame_watch_ops);
 	watchlist_init(&netdev->station_watches, NULL);
 
 	l_queue_push_tail(netdev_list, netdev);
@@ -4570,7 +4588,7 @@ struct netdev *netdev_create_from_genl(struct l_genl_msg *msg, bool random_mac)
 	memset(rtmmsg, 0, bufsize);
 
 	rtmmsg->ifi_family = AF_UNSPEC;
-	rtmmsg->ifi_index = *ifindex;
+	rtmmsg->ifi_index = ifindex;
 
 	l_netlink_send(rtnl, RTM_GETLINK, 0, rtmmsg, bufsize,
 					netdev_getlink_cb, NULL, NULL);
@@ -4578,26 +4596,26 @@ struct netdev *netdev_create_from_genl(struct l_genl_msg *msg, bool random_mac)
 	l_free(rtmmsg);
 
 	/* Subscribe to Management -> Action -> RM -> Neighbor Report frames */
-	netdev_frame_watch_add(netdev, 0x00d0, action_neighbor_report_prefix,
-				sizeof(action_neighbor_report_prefix),
-				netdev_neighbor_report_frame_event, NULL);
+	frame_watch_add(wdev, 0, 0x00d0, action_neighbor_report_prefix,
+			sizeof(action_neighbor_report_prefix),
+			netdev_neighbor_report_frame_event, netdev, NULL);
 
-	netdev_frame_watch_add(netdev, 0x00d0, action_sa_query_resp_prefix,
-				sizeof(action_sa_query_resp_prefix),
-				netdev_sa_query_resp_frame_event, NULL);
+	frame_watch_add(wdev, 0, 0x00d0, action_sa_query_resp_prefix,
+			sizeof(action_sa_query_resp_prefix),
+			netdev_sa_query_resp_frame_event, netdev, NULL);
 
-	netdev_frame_watch_add(netdev, 0x00d0, action_sa_query_req_prefix,
-				sizeof(action_sa_query_req_prefix),
-				netdev_sa_query_req_frame_event, NULL);
+	frame_watch_add(wdev, 0, 0x00d0, action_sa_query_req_prefix,
+			sizeof(action_sa_query_req_prefix),
+			netdev_sa_query_req_frame_event, netdev, NULL);
 
-	netdev_frame_watch_add(netdev, 0x00d0, action_ft_response_prefix,
-				sizeof(action_ft_response_prefix),
-				netdev_ft_response_frame_event, NULL);
+	frame_watch_add(wdev, 0, 0x00d0, action_ft_response_prefix,
+			sizeof(action_ft_response_prefix),
+			netdev_ft_response_frame_event, netdev, NULL);
 
 	if (wiphy_supports_qos_set_map(netdev->wiphy))
-		netdev_frame_watch_add(netdev, 0x00d0, action_qos_map_prefix,
-					sizeof(action_qos_map_prefix),
-					netdev_qos_map_frame_event, NULL);
+		frame_watch_add(wdev, 0, 0x00d0, action_qos_map_prefix,
+				sizeof(action_qos_map_prefix),
+				netdev_qos_map_frame_event, netdev, NULL);
 
 	/* Set RSSI threshold for CQM notifications */
 	if (netdev->type == NL80211_IFTYPE_STATION)
@@ -4664,20 +4682,12 @@ static int netdev_init(void)
 {
 	struct l_genl *genl = iwd_get_genl();
 	const struct l_settings *settings = iwd_get_config();
+	const char *rand_addr_str;
 
 	if (rtnl)
 		return -EALREADY;
 
-	l_debug("Opening route netlink socket");
-
-	rtnl = l_netlink_new(NETLINK_ROUTE);
-	if (!rtnl) {
-		l_error("Failed to open route netlink socket");
-		return -EIO;
-	}
-
-	if (getenv("IWD_RTNL_DEBUG"))
-		l_netlink_set_debug(rtnl, do_debug, "[RTNL] ", NULL);
+	rtnl = iwd_get_rtnl();
 
 	if (!l_netlink_register(rtnl, RTNLGRP_LINK,
 				netdev_link_notify, NULL, NULL)) {
@@ -4698,6 +4708,11 @@ static int netdev_init(void)
 	if (!l_settings_get_bool(settings, "General", "ControlPortOverNL80211",
 					&pae_over_nl80211))
 		pae_over_nl80211 = true;
+
+	rand_addr_str = l_settings_get_value(settings, "General",
+						"AddressRandomization");
+	if (rand_addr_str && !strcmp(rand_addr_str, "network"))
+		mac_per_ssid = true;
 
 	watchlist_init(&netdev_watches, NULL);
 	netdev_list = l_queue_new();
@@ -4722,7 +4737,6 @@ static int netdev_init(void)
 	return 0;
 
 fail_netlink:
-	l_netlink_destroy(rtnl);
 	rtnl = NULL;
 
 	return -EIO;
@@ -4742,8 +4756,6 @@ static void netdev_exit(void)
 	l_genl_family_free(nl80211);
 	nl80211 = NULL;
 
-	l_debug("Closing route netlink socket");
-	l_netlink_destroy(rtnl);
 	rtnl = NULL;
 }
 

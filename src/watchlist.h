@@ -38,6 +38,7 @@ struct watchlist {
 	struct l_queue *items;
 	bool in_notify : 1;
 	bool stale_items : 1;
+	bool pending_destroy : 1;
 	const struct watchlist_ops *ops;
 };
 
@@ -57,30 +58,36 @@ void watchlist_free(struct watchlist *watchlist);
 
 void __watchlist_prune_stale(struct watchlist *watchlist);
 
-#define WATCHLIST_NOTIFY(watchlist, type, args...)			\
+#define WATCHLIST_NOTIFY(list, type, args...)				\
 	do {								\
+		struct watchlist *watchlist = (list);			\
 		const struct l_queue_entry *entry =			\
-				l_queue_get_entries((watchlist)->items);\
+				l_queue_get_entries(watchlist->items);	\
 									\
-		(watchlist)->in_notify = true;				\
+		watchlist->in_notify = true;				\
 		for (; entry; entry = entry->next) {			\
 			struct watchlist_item *item = entry->data;	\
 			type t = item->notify;				\
 			if (item->id == 0)				\
 				continue;				\
 			t(args, item->notify_data);			\
+			if (watchlist->pending_destroy)			\
+				break;					\
 		}							\
-		(watchlist)->in_notify = false;				\
-		if ((watchlist)->stale_items)				\
+		watchlist->in_notify = false;				\
+		if (watchlist->pending_destroy)				\
+			watchlist_destroy(watchlist);			\
+		else if (watchlist->stale_items)			\
 			__watchlist_prune_stale(watchlist);		\
 	} while	(false)							\
 
-#define WATCHLIST_NOTIFY_MATCHES(watchlist, match, match_data, type, args...) \
+#define WATCHLIST_NOTIFY_MATCHES(list, match, match_data, type, args...) \
 	do {								\
+		struct watchlist *watchlist = (list);			\
 		const struct l_queue_entry *entry =			\
-				l_queue_get_entries((watchlist)->items);\
+				l_queue_get_entries(watchlist->items);	\
 									\
-		(watchlist)->in_notify = true;				\
+		watchlist->in_notify = true;				\
 		for (; entry; entry = entry->next) {			\
 			struct watchlist_item *item = entry->data;	\
 			type t = item->notify;				\
@@ -91,26 +98,36 @@ void __watchlist_prune_stale(struct watchlist *watchlist);
 				continue;				\
 									\
 			t(args, item->notify_data);			\
+									\
+			if (watchlist->pending_destroy)			\
+				break;					\
 		}							\
-		(watchlist)->in_notify = false;				\
-		if ((watchlist)->stale_items)				\
+		watchlist->in_notify = false;				\
+		if (watchlist->pending_destroy)				\
+			watchlist_destroy(watchlist);			\
+		else if (watchlist->stale_items)			\
 			__watchlist_prune_stale(watchlist);		\
 	} while	(false)
 
-#define WATCHLIST_NOTIFY_NO_ARGS(watchlist, type)			\
+#define WATCHLIST_NOTIFY_NO_ARGS(list, type)				\
 	do {								\
+		struct watchlist *watchlist = (list);			\
 		const struct l_queue_entry *entry =			\
-				l_queue_get_entries((watchlist)->items);\
+				l_queue_get_entries(watchlist->items);	\
 									\
-		(watchlist)->in_notify = true;				\
+		watchlist->in_notify = true;				\
 		for (; entry; entry = entry->next) {			\
 			struct watchlist_item *item = entry->data;	\
 			type t = item->notify;				\
 			if (item->id == 0)				\
 				continue;				\
-			t(item->notify_data);			\
+			t(item->notify_data);				\
+			if (watchlist->pending_destroy)			\
+				break;					\
 		}							\
-		(watchlist)->in_notify = false;				\
-		if ((watchlist)->stale_items)				\
+		watchlist->in_notify = false;				\
+		if (watchlist->pending_destroy)				\
+			watchlist_destroy(watchlist);			\
+		else if (watchlist->stale_items)			\
 			__watchlist_prune_stale(watchlist);		\
 	} while	(false)

@@ -22,11 +22,19 @@
 
 #define uninitialized_var(x) x = x
 
+/*
+ * Set a maximum to prevent sending too much data to the kernel when hashing
+ * the password (or any other crypto operations involving the password).
+ * This value is not tied to IEEE or any RFC's, just chosen to be long enough
+ */
+#define IWD_MAX_PASSWORD_LEN	2048
+
 struct l_genl;
 struct l_genl_family;
 
 const struct l_settings *iwd_get_config(void);
 struct l_genl *iwd_get_genl(void);
+struct l_netlink *iwd_get_rtnl(void);
 
 void netdev_shutdown(void);
 

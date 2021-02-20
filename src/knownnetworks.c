@@ -39,6 +39,11 @@
 #include "src/storage.h"
 #include "src/common.h"
 #include "src/network.h"
+#ifdef HAVE_DBUS
+#include "src/dbus.h"
+#else
+#define IWD_BASE_PATH "/net/connman/iwd"
+#endif
 #include "src/knownnetworks.h"
 #include "src/scan.h"
 #include "src/util.h"
@@ -121,6 +126,23 @@ int known_network_offset(const struct network_info *target)
 	return -ENOENT;
 }
 
+#ifdef HAVE_DBUS
+static void known_network_register_dbus(struct network_info *network)
+{
+	const char *path = known_network_get_path(network);
+
+	if (!l_dbus_object_add_interface(dbus_get_bus(), path,
+					IWD_KNOWN_NETWORK_INTERFACE, network))
+		l_info("Unable to register %s interface",
+						IWD_KNOWN_NETWORK_INTERFACE);
+
+	if (!l_dbus_object_add_interface(dbus_get_bus(), path,
+					L_DBUS_INTERFACE_PROPERTIES, network))
+		l_info("Unable to register %s interface",
+						L_DBUS_INTERFACE_PROPERTIES);
+}
+#endif
+
 static void known_network_set_autoconnect(struct network_info *network,
 							bool autoconnect)
 {
@@ -128,6 +150,11 @@ static void known_network_set_autoconnect(struct network_info *network,
 		return;
 
 	network->is_autoconnectable = autoconnect;
+
+#ifdef HAVE_DBUS
+	l_dbus_property_changed(dbus_get_bus(), known_network_get_path(network),
+				IWD_KNOWN_NETWORK_INTERFACE, "AutoConnect");
+#endif
 }
 
 static int known_network_touch(struct network_info *info)
@@ -319,20 +346,30 @@ bool network_info_match_nai_realm(const struct network_info *info,
 	return info->ops->match_nai_realms(info, nai_realms);
 }
 
-void known_network_update(struct network_info *network,
-					struct l_settings *settings,
+void known_network_set_connected_time(struct network_info *network,
 					uint64_t connected_time)
+{
+	if (network->connected_time == connected_time)
+		return;
+
+	network->connected_time = connected_time;
+
+#ifdef HAVE_DBUS
+	l_dbus_property_changed(dbus_get_bus(),
+				known_network_get_path(network),
+				IWD_KNOWN_NETWORK_INTERFACE,
+				"LastConnectedTime");
+#endif
+
+	l_queue_remove(known_networks, network);
+	l_queue_insert(known_networks, network, connected_time_compare, NULL);
+}
+
+void known_network_update(struct network_info *network,
+					struct l_settings *settings)
 {
 	bool is_hidden;
 	bool is_autoconnectable;
-
-	if (network->connected_time != connected_time) {
-		l_queue_remove(known_networks, network);
-		l_queue_insert(known_networks, network, connected_time_compare,
-				NULL);
-	}
-
-	network->connected_time = connected_time;
 
 	if (!l_settings_get_bool(settings, "Settings", "Hidden", &is_hidden))
 		is_hidden = false;
@@ -342,6 +379,13 @@ void known_network_update(struct network_info *network,
 			num_known_hidden_networks--;
 		else if (!network->is_hidden && is_hidden)
 			num_known_hidden_networks++;
+
+#ifdef HAVE_DBUS
+		l_dbus_property_changed(dbus_get_bus(),
+					known_network_get_path(network),
+					IWD_KNOWN_NETWORK_INTERFACE,
+					"Hidden");
+#endif
 	}
 
 	network->is_hidden = is_hidden;
@@ -472,12 +516,158 @@ int known_network_add_frequency(struct network_info *info, uint32_t frequency)
 	return 0;
 }
 
+#ifdef HAVE_DBUS
+static struct l_dbus_message *known_network_forget(struct l_dbus *dbus,
+						struct l_dbus_message *message,
+						void *user_data)
+{
+	struct network_info *network = user_data;
+	struct l_dbus_message *reply;
+
+	/* Other actions taken care of by the filesystem watch callback */
+	network->ops->remove(network);
+
+	reply = l_dbus_message_new_method_return(message);
+	l_dbus_message_set_arguments(reply, "");
+
+	return reply;
+}
+
+static bool known_network_property_get_name(struct l_dbus *dbus,
+					struct l_dbus_message *message,
+					struct l_dbus_message_builder *builder,
+					void *user_data)
+{
+	struct network_info *network = user_data;
+
+	l_dbus_message_builder_append_basic(builder, 's',
+						network_info_get_name(network));
+
+	return true;
+}
+
+static bool known_network_property_get_type(struct l_dbus *dbus,
+					struct l_dbus_message *message,
+					struct l_dbus_message_builder *builder,
+					void *user_data)
+{
+	struct network_info *network = user_data;
+
+	l_dbus_message_builder_append_basic(builder, 's',
+						network_info_get_type(network));
+
+	return true;
+}
+
+static bool known_network_property_get_hidden(struct l_dbus *dbus,
+					struct l_dbus_message *message,
+					struct l_dbus_message_builder *builder,
+					void *user_data)
+{
+	struct network_info *network = user_data;
+	bool is_hidden = network->is_hidden;
+
+	l_dbus_message_builder_append_basic(builder, 'b', &is_hidden);
+
+	return true;
+}
+
+static bool known_network_property_get_autoconnect(struct l_dbus *dbus,
+					struct l_dbus_message *message,
+					struct l_dbus_message_builder *builder,
+					void *user_data)
+{
+	struct network_info *network = user_data;
+	bool autoconnect = network->is_autoconnectable;
+
+	l_dbus_message_builder_append_basic(builder, 'b', &autoconnect);
+
+	return true;
+}
+
+static struct l_dbus_message *known_network_property_set_autoconnect(
+					struct l_dbus *dbus,
+					struct l_dbus_message *message,
+					struct l_dbus_message_iter *new_value,
+					l_dbus_property_complete_cb_t complete,
+					void *user_data)
+{
+	struct network_info *network = user_data;
+	struct l_settings *settings;
+	bool autoconnect;
+
+	if (!l_dbus_message_iter_get_variant(new_value, "b", &autoconnect))
+		return dbus_error_invalid_args(message);
+
+	if (network->is_autoconnectable == autoconnect)
+		return l_dbus_message_new_method_return(message);
+
+	settings = network->ops->open(network);
+	if (!settings)
+		return dbus_error_failed(message);
+
+	l_settings_set_bool(settings, "Settings", "AutoConnect", autoconnect);
+
+	network->ops->sync(network, settings);
+	l_settings_free(settings);
+
+	return l_dbus_message_new_method_return(message);
+}
+
+static bool known_network_property_get_last_connected(struct l_dbus *dbus,
+					struct l_dbus_message *message,
+					struct l_dbus_message_builder *builder,
+					void *user_data)
+{
+	struct network_info *network = user_data;
+	char datestr[64];
+	struct tm tm;
+	time_t seconds = l_time_to_secs(network->connected_time);
+
+	if (network->connected_time == 0)
+		return false;
+
+	gmtime_r(&seconds, &tm);
+
+	if (!strftime(datestr, sizeof(datestr), "%FT%TZ", &tm))
+		return false;
+
+	l_dbus_message_builder_append_basic(builder, 's', datestr);
+
+	return true;
+}
+
+static void setup_known_network_interface(struct l_dbus_interface *interface)
+{
+	l_dbus_interface_method(interface, "Forget", 0,
+				known_network_forget, "", "");
+
+	l_dbus_interface_property(interface, "Name", 0, "s",
+					known_network_property_get_name, NULL);
+	l_dbus_interface_property(interface, "Type", 0, "s",
+					known_network_property_get_type, NULL);
+	l_dbus_interface_property(interface, "Hidden", 0, "b",
+					known_network_property_get_hidden,
+					NULL);
+	l_dbus_interface_property(interface, "AutoConnect", 0, "b",
+					known_network_property_get_autoconnect,
+					known_network_property_set_autoconnect);
+	l_dbus_interface_property(interface, "LastConnectedTime", 0, "s",
+				known_network_property_get_last_connected,
+				NULL);
+}
+#endif
+
 void known_networks_remove(struct network_info *network)
 {
 	if (network->is_hidden)
 		num_known_hidden_networks--;
 
 	l_queue_remove(known_networks, network);
+#ifdef HAVE_DBUS
+	l_dbus_unregister_object(dbus_get_bus(),
+					known_network_get_path(network));
+#endif
 
 	WATCHLIST_NOTIFY(&known_network_watches,
 				known_networks_watch_func_t,
@@ -497,6 +687,9 @@ void known_networks_remove(struct network_info *network)
 void known_networks_add(struct network_info *network)
 {
 	l_queue_insert(known_networks, network, connected_time_compare, NULL);
+#ifdef HAVE_DBUS
+	known_network_register_dbus(network);
+#endif
 
 	WATCHLIST_NOTIFY(&known_network_watches,
 				known_networks_watch_func_t,
@@ -584,10 +777,11 @@ static void known_networks_watch_cb(const char *filename,
 		if (settings) {
 			connected_time = l_path_get_mtime(full_path);
 
-			if (network_before)
-				known_network_update(network_before, settings,
+			if (network_before) {
+				known_network_set_connected_time(network_before,
 							connected_time);
-			else
+				known_network_update(network_before, settings);
+			} else
 				known_network_new(ssid, security, settings,
 							connected_time);
 		} else if (network_before)
@@ -597,6 +791,14 @@ static void known_networks_watch_cb(const char *filename,
 
 		break;
 	case L_DIR_WATCH_EVENT_ACCESSED:
+		break;
+	case L_DIR_WATCH_EVENT_ATTRIB:
+		if (network_before) {
+			connected_time = l_path_get_mtime(full_path);
+			known_network_set_connected_time(network_before,
+								connected_time);
+		}
+
 		break;
 	}
 }
@@ -802,14 +1004,30 @@ void known_networks_watch_remove(uint32_t id)
 
 static int known_networks_init(void)
 {
+#ifdef HAVE_DBUS
+	struct l_dbus *dbus = dbus_get_bus();
+#endif
 	DIR *dir;
 	struct dirent *dirent;
 
 	L_AUTO_FREE_VAR(char *, storage_dir) = storage_get_path(NULL);
 
+#ifdef HAVE_DBUS
+	if (!l_dbus_register_interface(dbus, IWD_KNOWN_NETWORK_INTERFACE,
+						setup_known_network_interface,
+						NULL, false)) {
+		l_info("Unable to register %s interface",
+				IWD_KNOWN_NETWORK_INTERFACE);
+		return -EPERM;
+	}
+#endif
+
 	dir = opendir(storage_dir);
 	if (!dir) {
 		l_info("Unable to open %s: %s", storage_dir, strerror(errno));
+#ifdef HAVE_DBUS
+		l_dbus_unregister_interface(dbus, IWD_KNOWN_NETWORK_INTERFACE);
+#endif
 		return -ENOENT;
 	}
 
@@ -856,10 +1074,18 @@ static int known_networks_init(void)
 
 static void known_networks_exit(void)
 {
+#ifdef HAVE_DBUS
+	struct l_dbus *dbus = dbus_get_bus();
+#endif
+
 	l_dir_watch_destroy(storage_dir_watch);
 
 	l_queue_destroy(known_networks, network_info_free);
 	known_networks = NULL;
+
+#ifdef HAVE_DBUS
+	l_dbus_unregister_interface(dbus, IWD_KNOWN_NETWORK_INTERFACE);
+#endif
 
 	watchlist_destroy(&known_network_watches);
 }

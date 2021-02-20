@@ -144,9 +144,9 @@ static bool sae_cn(const uint8_t *kck, uint16_t send_confirm,
 	iov[2].iov_base = (void *) e1;
 	iov[2].iov_len = l_ecc_point_get_data(element1, e1, sizeof(e1));
 	iov[3].iov_base = (void *) s2;
-	iov[3].iov_len = l_ecc_scalar_get_data(scalar2, s2, sizeof(s2));;
+	iov[3].iov_len = l_ecc_scalar_get_data(scalar2, s2, sizeof(s2));
 	iov[4].iov_base = (void *) e2;
-	iov[4].iov_len = l_ecc_point_get_data(element2, e2, sizeof(e2));;
+	iov[4].iov_len = l_ecc_point_get_data(element2, e2, sizeof(e2));
 
 	l_checksum_updatev(hmac, iov, 5);
 
@@ -354,7 +354,7 @@ static bool sae_build_commit(struct sae_sm *sm, const uint8_t *addr1,
 
 	/*
 	 * Several cases require retransmitting the same commit message. The
-	 * anti-clogging code path requires this as well as the retransmition
+	 * anti-clogging code path requires this as well as the retransmission
 	 * timeout.
 	 */
 old_commit:

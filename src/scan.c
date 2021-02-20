@@ -204,8 +204,6 @@ static void scan_request_triggered(struct l_genl_msg *msg, void *userdata)
 	struct scan_request *sr = l_queue_peek_head(sc->requests);
 	int err;
 
-	l_debug("");
-
 	sc->start_cmd_id = 0;
 
 	err = l_genl_msg_get_error(msg);
@@ -879,7 +877,7 @@ static bool scan_parse_vendor_specific(struct scan_bss *bss, const void *data,
 
 /*
  * Fully parses the Advertisement Protocol Element. The only thing being looked
- * for is the ANQP protocol ID, but this could be burried behind several other
+ * for is the ANQP protocol ID, but this could be buried behind several other
  * advertisement tuples so the entire IE may need to be parsed.
  */
 static bool scan_parse_advertisement_protocol(struct scan_bss *bss,
@@ -1703,7 +1701,8 @@ static void scan_notify(struct l_genl_msg *msg, void *user_data)
 		else
 			sc->state = SCAN_STATE_PASSIVE;
 
-		sr->start_time_tsf = start_time_tsf;
+		if (sr)
+			sr->start_time_tsf = start_time_tsf;
 
 		break;
 

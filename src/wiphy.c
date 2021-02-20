@@ -37,12 +37,40 @@
 
 #include "linux/nl80211.h"
 
+#include "src/missing.h"
 #include "src/iwd.h"
 #include "src/module.h"
 #include "src/ie.h"
 #include "src/crypto.h"
 #include "src/scan.h"
 #include "src/netdev.h"
+#ifdef HAVE_DBUS
+#include "src/dbus.h"
+#else
+#define IWD_BASE_PATH "/net/connman/iwd"
+
+const char *dbus_iftype_to_string(uint32_t iftype)
+{
+	switch (iftype) {
+	case NL80211_IFTYPE_ADHOC:
+		return "ad-hoc";
+	case NL80211_IFTYPE_STATION:
+		return "station";
+	case NL80211_IFTYPE_AP:
+		return "ap";
+	case NL80211_IFTYPE_P2P_CLIENT:
+		return "p2p-client";
+	case NL80211_IFTYPE_P2P_GO:
+		return "p2p-go";
+	case NL80211_IFTYPE_P2P_DEVICE:
+		return "p2p-device";
+	default:
+		break;
+	}
+
+	return NULL;
+}
+#endif
 #include "src/rfkill.h"
 #include "src/wiphy.h"
 #include "src/storage.h"
@@ -50,6 +78,7 @@
 #include "src/common.h"
 #include "src/watchlist.h"
 #include "src/nl80211util.h"
+#include "src/nl80211cmd.h"
 
 #define EXT_CAP_LEN 10
 
@@ -61,6 +90,7 @@ static struct l_hwdb *hwdb;
 static char **whitelist_filter;
 static char **blacklist_filter;
 static int mac_randomize_bytes = 6;
+static char regdom_country[2];
 
 struct wiphy {
 	uint32_t id;
@@ -82,14 +112,19 @@ struct wiphy {
 	uint8_t *iftype_extended_capabilities[NUM_NL80211_IFTYPES];
 	uint8_t *supported_rates[NUM_NL80211_BANDS];
 	uint8_t rm_enabled_capabilities[7]; /* 5 size max + header */
+	struct l_genl_family *nl80211;
+	char regdom_country[2];
 
 	bool support_scheduled_scan:1;
 	bool support_rekey_offload:1;
 	bool support_adhoc_rsn:1;
 	bool support_qos_set_map:1;
+	bool support_cmds_auth_assoc:1;
 	bool soft_rfkill : 1;
 	bool hard_rfkill : 1;
 	bool offchannel_tx_ok : 1;
+	bool blacklisted : 1;
+	bool registered : 1;
 };
 
 static struct l_queue *wiphy_list = NULL;
@@ -151,7 +186,8 @@ enum ie_rsn_akm_suite wiphy_select_akm(struct wiphy *wiphy,
 		}
 
 		if ((info.akm_suites & IE_RSN_AKM_SUITE_FT_OVER_8021X) &&
-				bss->rsne && bss->mde_present)
+				bss->rsne && bss->mde_present &&
+				wiphy->support_cmds_auth_assoc)
 			return IE_RSN_AKM_SUITE_FT_OVER_8021X;
 
 		if (info.akm_suites & IE_RSN_AKM_SUITE_8021X_SHA256)
@@ -169,8 +205,9 @@ enum ie_rsn_akm_suite wiphy_select_akm(struct wiphy *wiphy,
 		if (wiphy->supported_ciphers & IE_RSN_CIPHER_SUITE_BIP &&
 				wiphy_has_feature(wiphy, NL80211_FEATURE_SAE) &&
 				info.mfpr) {
-			if (info.akm_suites &
-					IE_RSN_AKM_SUITE_FT_OVER_SAE_SHA256)
+			if ((info.akm_suites &
+					IE_RSN_AKM_SUITE_FT_OVER_SAE_SHA256) &&
+					wiphy->support_cmds_auth_assoc)
 				return IE_RSN_AKM_SUITE_FT_OVER_SAE_SHA256;
 
 			if (info.akm_suites & IE_RSN_AKM_SUITE_SAE_SHA256)
@@ -178,7 +215,8 @@ enum ie_rsn_akm_suite wiphy_select_akm(struct wiphy *wiphy,
 		}
 
 		if ((info.akm_suites & IE_RSN_AKM_SUITE_FT_USING_PSK) &&
-				bss->rsne && bss->mde_present)
+				bss->rsne && bss->mde_present &&
+				wiphy->support_cmds_auth_assoc)
 			return IE_RSN_AKM_SUITE_FT_USING_PSK;
 
 		if (info.akm_suites & IE_RSN_AKM_SUITE_PSK_SHA256)
@@ -225,6 +263,7 @@ static void wiphy_free(void *data)
 	l_free(wiphy->model_str);
 	l_free(wiphy->vendor_str);
 	l_free(wiphy->driver_str);
+	l_genl_family_free(wiphy->nl80211);
 	l_free(wiphy);
 }
 
@@ -239,6 +278,11 @@ static bool wiphy_match(const void *a, const void *b)
 struct wiphy *wiphy_find(int wiphy_id)
 {
 	return l_queue_find(wiphy_list, wiphy_match, L_UINT_TO_PTR(wiphy_id));
+}
+
+bool wiphy_is_blacklisted(const struct wiphy *wiphy)
+{
+	return wiphy->blacklisted;
 }
 
 static bool wiphy_is_managed(const char *phy)
@@ -284,6 +328,11 @@ const char *wiphy_get_path(struct wiphy *wiphy)
 	return path;
 }
 
+uint32_t wiphy_get_id(struct wiphy *wiphy)
+{
+	return wiphy->id;
+}
+
 uint32_t wiphy_get_supported_bands(struct wiphy *wiphy)
 {
 	if (!wiphy->supported_freqs)
@@ -317,16 +366,32 @@ bool wiphy_can_connect(struct wiphy *wiphy, struct scan_bss *bss)
 					rsn_info.group_management_cipher))
 			return false;
 
-		/*
-		 * if the AP ONLY supports SAE/WPA3, then we can only connect
-		 * if the wiphy feature is supported. Otherwise the AP may list
-		 * SAE as one of the AKM's but also support PSK (hybrid). In
-		 * this case we still want to allow a connection even if SAE
-		 * is not supported.
-		 */
-		if (IE_AKM_IS_SAE(rsn_info.akm_suites) &&
-				!wiphy_has_feature(wiphy, NL80211_FEATURE_SAE))
-			return false;
+
+		switch (rsn_info.akm_suites) {
+		case IE_RSN_AKM_SUITE_SAE_SHA256:
+		case IE_RSN_AKM_SUITE_FT_OVER_SAE_SHA256:
+			/*
+			 * if the AP ONLY supports SAE/WPA3, then we can only
+			 * connect if the wiphy feature is supported. Otherwise
+			 * the AP may list SAE as one of the AKM's but also
+			 * support PSK (hybrid). In this case we still want to
+			 * allow a connection even if SAE is not supported.
+			 */
+			if (!wiphy_has_feature(wiphy, NL80211_FEATURE_SAE) ||
+						!wiphy->support_cmds_auth_assoc)
+				return false;
+
+			break;
+		case IE_RSN_AKM_SUITE_OWE:
+		case IE_RSN_AKM_SUITE_FILS_SHA256:
+		case IE_RSN_AKM_SUITE_FILS_SHA384:
+		case IE_RSN_AKM_SUITE_FT_OVER_FILS_SHA256:
+		case IE_RSN_AKM_SUITE_FT_OVER_FILS_SHA384:
+			if (!wiphy->support_cmds_auth_assoc)
+				return false;
+
+			break;
+		}
 	} else if (r != -ENOENT)
 		return false;
 
@@ -424,12 +489,10 @@ const uint8_t *wiphy_get_rm_enabled_capabilities(struct wiphy *wiphy)
 	return wiphy->rm_enabled_capabilities;
 }
 
-void wiphy_generate_random_address(struct wiphy *wiphy, uint8_t addr[static 6])
+static void wiphy_address_constrain(struct wiphy *wiphy, uint8_t addr[static 6])
 {
 	switch (mac_randomize_bytes) {
 	case 6:
-		l_getrandom(addr, 6);
-
 		/* Set the locally administered bit */
 		addr[0] |= 0x2;
 
@@ -437,7 +500,6 @@ void wiphy_generate_random_address(struct wiphy *wiphy, uint8_t addr[static 6])
 		addr[0] &= 0xfe;
 		break;
 	case 3:
-		l_getrandom(addr + 3, 3);
 		memcpy(addr, wiphy->permanent_addr, 3);
 		break;
 	}
@@ -451,6 +513,35 @@ void wiphy_generate_random_address(struct wiphy *wiphy, uint8_t addr[static 6])
 	addr[5] &= 0xfe;
 	if (util_mem_is_zero(addr + 3, 3))
 		addr[5] = 0x01;
+}
+
+void wiphy_generate_random_address(struct wiphy *wiphy, uint8_t addr[static 6])
+{
+	switch (mac_randomize_bytes) {
+	case 6:
+		l_getrandom(addr, 6);
+		break;
+	case 3:
+		l_getrandom(addr + 3, 3);
+		break;
+	}
+
+	wiphy_address_constrain(wiphy, addr);
+}
+
+void wiphy_generate_address_from_ssid(struct wiphy *wiphy, const char *ssid,
+					uint8_t addr[static 6])
+{
+	struct l_checksum *sha = l_checksum_new(L_CHECKSUM_SHA256);
+
+	l_checksum_update(sha, ssid, strlen(ssid));
+	l_checksum_update(sha, wiphy->permanent_addr,
+				sizeof(wiphy->permanent_addr));
+	l_checksum_get_digest(sha, addr, mac_randomize_bytes);
+
+	l_checksum_free(sha);
+
+	wiphy_address_constrain(wiphy, addr);
 }
 
 bool wiphy_constrain_freq_set(const struct wiphy *wiphy,
@@ -530,6 +621,18 @@ const uint8_t *wiphy_get_supported_rates(struct wiphy *wiphy, unsigned int band,
 	return wiphy->supported_rates[band];
 }
 
+void wiphy_get_reg_domain_country(struct wiphy *wiphy, char *out)
+{
+	char *country = wiphy->regdom_country;
+
+	if (!country[0])
+		/* Wiphy uses the global regulatory domain */
+		country = regdom_country;
+
+	out[0] = country[0];
+	out[1] = country[1];
+}
+
 uint32_t wiphy_state_watch_add(struct wiphy *wiphy,
 				wiphy_state_watch_func_t func,
 				void *user_data, wiphy_destroy_func_t destroy)
@@ -599,6 +702,8 @@ static void parse_supported_commands(struct wiphy *wiphy,
 {
 	uint16_t type, len;
 	const void *data;
+	bool auth = false;
+	bool assoc = false;
 
 	while (l_genl_attr_next(attr, &type, &len, &data)) {
 		uint32_t cmd = *(uint32_t *)data;
@@ -613,8 +718,17 @@ static void parse_supported_commands(struct wiphy *wiphy,
 		case NL80211_CMD_SET_QOS_MAP:
 			wiphy->support_qos_set_map = true;
 			break;
+		case NL80211_CMD_AUTHENTICATE:
+			auth = true;
+			break;
+		case NL80211_CMD_ASSOCIATE:
+			assoc = true;
+			break;
 		}
 	}
+
+	if (auth && assoc)
+		wiphy->support_cmds_auth_assoc = true;
 }
 
 static void parse_supported_ciphers(struct wiphy *wiphy, const void *data,
@@ -654,8 +768,6 @@ static void parse_supported_frequencies(struct wiphy *wiphy,
 	uint16_t type, len;
 	const void *data;
 	struct l_genl_attr attr;
-
-	l_debug("");
 
 	while (l_genl_attr_next(freqs, NULL, NULL, NULL)) {
 		if (!l_genl_attr_recurse(freqs, &attr))
@@ -725,8 +837,6 @@ static void parse_supported_bands(struct wiphy *wiphy,
 {
 	uint16_t type;
 	struct l_genl_attr attr;
-
-	l_debug("");
 
 	while (l_genl_attr_next(bands, &type, NULL, NULL)) {
 		enum nl80211_band band = type;
@@ -946,6 +1056,10 @@ static int wiphy_get_permanent_addr_from_sysfs(struct wiphy *wiphy)
 
 static void wiphy_register(struct wiphy *wiphy)
 {
+#ifdef HAVE_DBUS
+	struct l_dbus *dbus = dbus_get_bus();
+#endif
+
 	wiphy->soft_rfkill = rfkill_get_soft_state(wiphy->id);
 	wiphy->hard_rfkill = rfkill_get_hard_state(wiphy->id);
 
@@ -983,33 +1097,64 @@ static void wiphy_register(struct wiphy *wiphy)
 	}
 
 	wiphy_get_driver_name(wiphy);
+
+#ifdef HAVE_DBUS
+	if (!l_dbus_object_add_interface(dbus, wiphy_get_path(wiphy),
+					IWD_WIPHY_INTERFACE, wiphy))
+		l_info("Unable to add the %s interface to %s",
+				IWD_WIPHY_INTERFACE, wiphy_get_path(wiphy));
+
+	if (!l_dbus_object_add_interface(dbus, wiphy_get_path(wiphy),
+					L_DBUS_INTERFACE_PROPERTIES, NULL))
+		l_info("Unable to add the %s interface to %s",
+				L_DBUS_INTERFACE_PROPERTIES,
+				wiphy_get_path(wiphy));
+#endif
+
+	wiphy->registered = true;
 }
 
 struct wiphy *wiphy_create(uint32_t wiphy_id, const char *name)
 {
 	struct wiphy *wiphy;
-
-	if (!wiphy_is_managed(name))
-		return NULL;
+    struct l_genl *genl = iwd_get_genl();
 
 	wiphy = wiphy_new(wiphy_id);
 	l_strlcpy(wiphy->name, name, sizeof(wiphy->name));
+    wiphy->nl80211 = l_genl_family_new(genl, NL80211_GENL_NAME);
 	l_queue_push_head(wiphy_list, wiphy);
 
-	wiphy_register(wiphy);
+	if (!wiphy_is_managed(name))
+		wiphy->blacklisted = true;
+
 	return wiphy;
 }
 
-void wiphy_update_from_genl(struct wiphy *wiphy, const char *name,
-				struct l_genl_msg *msg)
+void wiphy_update_from_genl(struct wiphy *wiphy, struct l_genl_msg *msg)
 {
-	l_debug("");
+	if (wiphy->blacklisted)
+		return;
+
+	wiphy_parse_attributes(wiphy, msg);
+}
+
+void wiphy_update_name(struct wiphy *wiphy, const char *name)
+{
+#ifdef HAVE_DBUS
+	bool updated = false;
 
 	if (strncmp(wiphy->name, name, sizeof(wiphy->name))) {
 		l_strlcpy(wiphy->name, name, sizeof(wiphy->name));
+		updated = true;
 	}
 
-	wiphy_parse_attributes(wiphy, msg);
+	if (updated && wiphy->registered) {
+		struct l_dbus *dbus = dbus_get_bus();
+
+		l_dbus_property_changed(dbus, wiphy_get_path(wiphy),
+					IWD_WIPHY_INTERFACE, "Name");
+	}
+#endif
 }
 
 static void wiphy_set_station_capability_bits(struct wiphy *wiphy)
@@ -1066,8 +1211,74 @@ static void wiphy_setup_rm_enabled_capabilities(struct wiphy *wiphy)
 	 */
 }
 
+static void wiphy_update_reg_domain(struct wiphy *wiphy, bool global,
+					struct l_genl_msg *msg)
+{
+	char *out_country;
+
+	if (global)
+		/*
+		 * Leave @wiphy->regdom_country as all zeros to mean that it
+		 * uses the global @regdom_country, i.e. is not self-managed.
+		 *
+		 * Even if we're called because we queried a new wiphy's
+		 * reg domain, use the value we received here to update our
+		 * global @regdom_country in case this is the first opportunity
+		 * we have to update it -- possibly because this is the first
+		 * wiphy created (that is not self-managed anyway) and we
+		 * haven't received any REG_CHANGE events yet.
+		 */
+		out_country = regdom_country;
+	else
+		out_country = wiphy->regdom_country;
+
+	/*
+	 * Write the new country code or XX if the reg domain is not a
+	 * country domain.
+	 */
+	if (nl80211_parse_attrs(msg, NL80211_ATTR_REG_ALPHA2, out_country,
+				NL80211_ATTR_UNSPEC) < 0)
+		out_country[0] = out_country[1] = 'X';
+
+	l_debug("New reg domain country code for %s is %c%c",
+		global ? "(global)" : wiphy->name,
+		out_country[0], out_country[1]);
+}
+
+static void wiphy_get_reg_cb(struct l_genl_msg *msg, void *user_data)
+{
+	struct wiphy *wiphy = user_data;
+	uint32_t tmp;
+	bool global;
+
+	/*
+	 * NL80211_CMD_GET_REG contains an NL80211_ATTR_WIPHY iff the wiphy
+	 * uses a self-managed regulatory domain.
+	 */
+	global = nl80211_parse_attrs(msg, NL80211_ATTR_WIPHY, &tmp,
+				NL80211_ATTR_UNSPEC) < 0;
+
+	wiphy_update_reg_domain(wiphy, global, msg);
+}
+
+static void wiphy_get_reg_domain(struct wiphy *wiphy)
+{
+	struct l_genl_msg *msg;
+
+	msg = l_genl_msg_new(NL80211_CMD_GET_REG);
+	l_genl_msg_append_attr(msg, NL80211_ATTR_WIPHY, 4, &wiphy->id);
+
+	if (!l_genl_family_send(wiphy->nl80211, msg, wiphy_get_reg_cb, wiphy,
+				NULL)) {
+		l_error("Error sending NL80211_CMD_GET_REG for %s", wiphy->name);
+		l_genl_msg_unref(msg);
+	}
+}
+
 void wiphy_create_complete(struct wiphy *wiphy)
 {
+	wiphy_register(wiphy);
+
 	if (util_mem_is_zero(wiphy->permanent_addr, 6)) {
 		int err = wiphy_get_permanent_addr_from_sysfs(wiphy);
 
@@ -1078,6 +1289,7 @@ void wiphy_create_complete(struct wiphy *wiphy)
 
 	wiphy_set_station_capability_bits(wiphy);
 	wiphy_setup_rm_enabled_capabilities(wiphy);
+	wiphy_get_reg_domain(wiphy);
 
 	wiphy_print_basic_info(wiphy);
 }
@@ -1089,6 +1301,11 @@ bool wiphy_destroy(struct wiphy *wiphy)
 	if (!l_queue_remove(wiphy_list, wiphy))
 		return false;
 
+#ifdef HAVE_DBUS
+	if (wiphy->registered)
+		l_dbus_unregister_object(dbus_get_bus(), wiphy_get_path(wiphy));
+#endif
+
 	wiphy_free(wiphy);
 	return true;
 }
@@ -1097,6 +1314,9 @@ static void wiphy_rfkill_cb(unsigned int wiphy_id, bool soft, bool hard,
 				void *user_data)
 {
 	struct wiphy *wiphy = wiphy_find(wiphy_id);
+#ifdef HAVE_DBUS
+	struct l_dbus *dbus = dbus_get_bus();
+#endif
 	bool old_powered, new_powered;
 	enum wiphy_state_watch_event event;
 
@@ -1117,12 +1337,182 @@ static void wiphy_rfkill_cb(unsigned int wiphy_id, bool soft, bool hard,
 				WIPHY_STATE_WATCH_EVENT_RFKILLED;
 	WATCHLIST_NOTIFY(&wiphy->state_watches, wiphy_state_watch_func_t,
 				wiphy, event);
+
+#ifdef HAVE_DBUS
+	l_dbus_property_changed(dbus, wiphy_get_path(wiphy),
+					IWD_WIPHY_INTERFACE, "Powered");
+#endif
+}
+
+#ifdef HAVE_DBUS
+static bool wiphy_property_get_powered(struct l_dbus *dbus,
+					struct l_dbus_message *message,
+					struct l_dbus_message_builder *builder,
+					void *user_data)
+{
+	struct wiphy *wiphy = user_data;
+	bool value = !wiphy->soft_rfkill && !wiphy->hard_rfkill;
+
+	l_dbus_message_builder_append_basic(builder, 'b', &value);
+
+	return true;
+}
+
+static struct l_dbus_message *wiphy_property_set_powered(struct l_dbus *dbus,
+					struct l_dbus_message *message,
+					struct l_dbus_message_iter *new_value,
+					l_dbus_property_complete_cb_t complete,
+					void *user_data)
+{
+	struct wiphy *wiphy = user_data;
+	bool old_powered, new_powered;
+
+	if (!l_dbus_message_iter_get_variant(new_value, "b", &new_powered))
+		return dbus_error_invalid_args(message);
+
+	old_powered = !wiphy->soft_rfkill && !wiphy->hard_rfkill;
+
+	if (old_powered == new_powered)
+		goto done;
+
+	if (wiphy->hard_rfkill)
+		return dbus_error_not_available(message);
+
+	if (!rfkill_set_soft_state(wiphy->id, !new_powered))
+		return dbus_error_failed(message);
+
+done:
+	complete(dbus, message, NULL);
+
+	return NULL;
+}
+
+static bool wiphy_property_get_model(struct l_dbus *dbus,
+					struct l_dbus_message *message,
+					struct l_dbus_message_builder *builder,
+					void *user_data)
+{
+	struct wiphy *wiphy = user_data;
+
+	if (!wiphy->model_str)
+		return false;
+
+	l_dbus_message_builder_append_basic(builder, 's', wiphy->model_str);
+
+	return true;
+}
+
+static bool wiphy_property_get_vendor(struct l_dbus *dbus,
+					struct l_dbus_message *message,
+					struct l_dbus_message_builder *builder,
+					void *user_data)
+{
+	struct wiphy *wiphy = user_data;
+
+	if (!wiphy->vendor_str)
+		return false;
+
+	l_dbus_message_builder_append_basic(builder, 's', wiphy->vendor_str);
+
+	return true;
+}
+
+static bool wiphy_property_get_name(struct l_dbus *dbus,
+					struct l_dbus_message *message,
+					struct l_dbus_message_builder *builder,
+					void *user_data)
+{
+	struct wiphy *wiphy = user_data;
+	char buf[20];
+
+	if (l_utf8_validate(wiphy->name, strlen(wiphy->name), NULL)) {
+		l_dbus_message_builder_append_basic(builder, 's', wiphy->name);
+		return true;
+	}
+
+	/*
+	 * In the highly unlikely scenario that the wiphy name is not utf8,
+	 * we simply use the canonical name phy<index>.  The kernel guarantees
+	 * that this name cannot be taken by any other wiphy, so this should
+	 * be safe enough.
+	 */
+	sprintf(buf, "phy%d", wiphy->id);
+	l_dbus_message_builder_append_basic(builder, 's', buf);
+
+	return true;
 }
 
 #define WIPHY_MODE_MASK	( \
 	(1 << (NL80211_IFTYPE_STATION - 1)) | \
 	(1 << (NL80211_IFTYPE_AP - 1)) | \
 	(1 << (NL80211_IFTYPE_ADHOC - 1)))
+
+static bool wiphy_property_get_supported_modes(struct l_dbus *dbus,
+					struct l_dbus_message *message,
+					struct l_dbus_message_builder *builder,
+					void *user_data)
+{
+	struct wiphy *wiphy = user_data;
+	unsigned int j = 0;
+	char **iftypes = wiphy_get_supported_iftypes(wiphy, WIPHY_MODE_MASK);
+
+	l_dbus_message_builder_enter_array(builder, "s");
+
+	while (iftypes[j])
+		l_dbus_message_builder_append_basic(builder, 's', iftypes[j++]);
+
+	l_dbus_message_builder_leave_array(builder);
+	l_strfreev(iftypes);
+
+	return true;
+}
+
+static void setup_wiphy_interface(struct l_dbus_interface *interface)
+{
+	l_dbus_interface_property(interface, "Powered", 0, "b",
+					wiphy_property_get_powered,
+					wiphy_property_set_powered);
+	l_dbus_interface_property(interface, "Model", 0, "s",
+					wiphy_property_get_model, NULL);
+	l_dbus_interface_property(interface, "Vendor", 0, "s",
+					wiphy_property_get_vendor, NULL);
+	l_dbus_interface_property(interface, "Name", 0, "s",
+					wiphy_property_get_name, NULL);
+	l_dbus_interface_property(interface, "SupportedModes", 0, "as",
+					wiphy_property_get_supported_modes,
+					NULL);
+}
+#endif
+
+static void wiphy_reg_notify(struct l_genl_msg *msg, void *user_data)
+{
+	uint8_t cmd = l_genl_msg_get_command(msg);
+
+	l_debug("Notification of command %s(%u)",
+		nl80211cmd_to_string(cmd), cmd);
+
+	switch (cmd) {
+	case NL80211_CMD_REG_CHANGE:
+		wiphy_update_reg_domain(NULL, true, msg);
+		break;
+	case NL80211_CMD_WIPHY_REG_CHANGE:
+	{
+		uint32_t wiphy_id;
+		struct wiphy *wiphy;
+
+		if (nl80211_parse_attrs(msg, NL80211_ATTR_WIPHY, &wiphy_id,
+					NL80211_ATTR_UNSPEC) < 0)
+			break;
+
+		wiphy = wiphy_find(wiphy_id);
+		if (!wiphy)
+			break;
+
+		wiphy_update_reg_domain(wiphy, false, msg);
+		break;
+	}
+	}
+}
 
 static int wiphy_init(void)
 {
@@ -1147,6 +1537,15 @@ static int wiphy_init(void)
 
 	rfkill_watch_add(wiphy_rfkill_cb, NULL);
 
+#ifdef HAVE_DBUS
+	if (!l_dbus_register_interface(dbus_get_bus(),
+					IWD_WIPHY_INTERFACE,
+					setup_wiphy_interface,
+					NULL, false))
+		l_error("Unable to register the %s interface",
+				IWD_WIPHY_INTERFACE);
+#endif
+
 	hwdb = l_hwdb_new_default();
 
 	if (whitelist)
@@ -1167,6 +1566,10 @@ static int wiphy_init(void)
 				" value: %s", s);
 	}
 
+	if (!l_genl_family_register(nl80211, NL80211_MULTICAST_GROUP_REG,
+					wiphy_reg_notify, NULL, NULL))
+		l_error("Registering for regulatory notifications failed");
+
 	return 0;
 }
 
@@ -1181,6 +1584,10 @@ static void wiphy_exit(void)
 	l_genl_family_free(nl80211);
 	nl80211 = NULL;
 	mac_randomize_bytes = 6;
+
+#ifdef HAVE_DBUS
+	l_dbus_unregister_interface(dbus_get_bus(), IWD_WIPHY_INTERFACE);
+#endif
 
 	l_hwdb_unref(hwdb);
 }

@@ -37,6 +37,9 @@
 #include "src/iwd.h"
 #include "src/module.h"
 #include "src/wiphy.h"
+#ifdef HAVE_DBUS
+#include "src/dbus.h"
+#endif
 #include "src/eap.h"
 #include "src/eapol.h"
 #include "src/rfkill.h"
@@ -47,6 +50,7 @@
 #include "src/backtrace.h"
 
 static struct l_genl *genl;
+static struct l_netlink *rtnl;
 static struct l_settings *iwd_config;
 static struct l_timeout *timeout;
 static const char *interfaces;
@@ -118,6 +122,9 @@ static void iwd_shutdown(void)
 		return;
 	}
 
+#ifdef HAVE_DBUS
+	dbus_shutdown();
+#endif
 	netdev_shutdown();
 
 	timeout = l_timeout_create(1, main_loop_quit, NULL, NULL);
@@ -142,6 +149,11 @@ const struct l_settings *iwd_get_config(void)
 struct l_genl *iwd_get_genl(void)
 {
 	return genl;
+}
+
+struct l_netlink *iwd_get_rtnl(void)
+{
+	return rtnl;
 }
 
 const char *iwd_get_iface_whitelist(void)
@@ -170,6 +182,9 @@ static void usage(void)
 		"Usage:\n");
 	printf("\tiwd [options]\n");
 	printf("Options:\n"
+#ifdef HAVE_DBUS
+		"\t-B, --dbus-debug       Enable D-Bus debugging\n"
+#endif
 		"\t-i, --interfaces       Interfaces to manage\n"
 		"\t-I, --nointerfaces     Interfaces to ignore\n"
 		"\t-p, --phys             Phys to manage\n"
@@ -182,6 +197,9 @@ static void usage(void)
 }
 
 static const struct option main_options[] = {
+#ifdef HAVE_DBUS
+	{ "dbus-debug",   no_argument,       NULL, 'B' },
+#endif
 	{ "version",      no_argument,       NULL, 'v' },
 	{ "interfaces",   required_argument, NULL, 'i' },
 	{ "nointerfaces", required_argument, NULL, 'I' },
@@ -215,6 +233,42 @@ static void nl80211_appeared(const struct l_genl_family_info *info,
 
 	plugin_init(plugins, noplugins);
 }
+
+#ifdef HAVE_DBUS
+static void request_name_callback(struct l_dbus *dbus, bool success,
+					bool queued, void *user_data)
+{
+	if (!success) {
+		l_error("Name request failed");
+		goto fail_exit;
+	}
+
+	if (!l_dbus_object_manager_enable(dbus, "/"))
+		l_warn("Unable to register the ObjectManager");
+
+	/* TODO: Always request nl80211 for now, ignoring auto-loading */
+	l_genl_request_family(genl, NL80211_GENL_NAME, nl80211_appeared,
+				NULL, NULL);
+	return;
+
+fail_exit:
+	l_main_quit();
+}
+
+static void dbus_ready(void *user_data)
+{
+	struct l_dbus *dbus = user_data;
+
+	l_dbus_name_acquire(dbus, "net.connman.iwd", false, false, false,
+				request_name_callback, NULL);
+}
+
+static void dbus_disconnected(void *user_data)
+{
+	l_info("D-Bus disconnected, quitting...");
+	iwd_shutdown();
+}
+#endif
 
 static void print_koption(const void *key, void *value, void *user_data)
 {
@@ -338,7 +392,7 @@ static int check_crypto()
 		l_hashmap_insert(options, "CONFIG_PKCS7_MESSAGE_PARSER", &r);
 		l_hashmap_insert(options,
 					"CONFIG_PKCS8_PRIVATE_KEY_PARSER", &r);
-	};
+	}
 
 	if (l_hashmap_isempty(options))
 		goto done;
@@ -368,10 +422,16 @@ done:
 
 int main(int argc, char *argv[])
 {
+#ifdef HAVE_DBUS
+	bool enable_dbus_debug = false;
+#endif
 	int exit_status;
+#ifdef HAVE_DBUS
+	struct l_dbus *dbus;
+#endif
 	const char *config_dir;
 	char **config_dirs;
-	int i;
+    int i;
 
 	for (;;) {
 		int opt;
@@ -382,6 +442,11 @@ int main(int argc, char *argv[])
 			break;
 
 		switch (opt) {
+#ifdef HAVE_DBUS
+		case 'B':
+			enable_dbus_debug = true;
+			break;
+#endif
 		case 'i':
 			interfaces = optarg;
 			break;
@@ -450,18 +515,17 @@ int main(int argc, char *argv[])
 	iwd_config = l_settings_new();
 
 	config_dirs = l_strsplit(config_dir, ':');
-	for (i = 0; config_dirs[i]; i++) {
-		char *path = l_strdup_printf("%s/%s", config_dirs[i],
-								"main.conf");
-		bool result = l_settings_load_from_file(iwd_config, path);
-		l_free(path);
+    for (i = 0; config_dirs[i]; i++) {
+        L_AUTO_FREE_VAR(char *, path) =
+            l_strdup_printf("%s/%s", config_dirs[i], "main.conf");
 
-		if (result) {
-			l_info("Loaded configuration from %s/main.conf",
-							config_dirs[i]);
-			break;
-		}
+        if (!l_settings_load_from_file(iwd_config, path))
+            continue;
+
+        l_info("Loaded configuration from %s", path);
+        break;
 	}
+  
 	l_strv_free(config_dirs);
 
 	__eapol_set_config(iwd_config);
@@ -470,33 +534,65 @@ int main(int argc, char *argv[])
 	exit_status = EXIT_FAILURE;
 
 	if (!storage_create_dirs())
-		goto fail;
+		goto failed_dirs;
 
 	genl = l_genl_new();
 	if (!genl) {
 		l_error("Failed to open generic netlink socket");
-		goto fail_genl;
+		goto failed_genl;
 	}
 
 	if (getenv("IWD_GENL_DEBUG"))
 		l_genl_set_debug(genl, do_debug, "[GENL] ", NULL);
 
-	clean_disconnect();
+	rtnl = l_netlink_new(NETLINK_ROUTE);
+	if (!rtnl) {
+		l_error("Failed to open route netlink socket");
+		goto failed_rtnl;
+	}
+
+	if (getenv("IWD_RTNL_DEBUG"))
+		l_netlink_set_debug(rtnl, do_debug, "[RTNL] ", NULL);
+
+#ifdef HAVE_DBUS
+	dbus = l_dbus_new_default(L_DBUS_SYSTEM_BUS);
+	if (!dbus) {
+		l_error("Failed to initialize D-Bus");
+		goto fail_dbus;
+	}
+
+	if (enable_dbus_debug)
+		l_dbus_set_debug(dbus, do_debug, "[DBUS] ", NULL);
+
+	l_dbus_set_ready_handler(dbus, dbus_ready, dbus, NULL);
+	l_dbus_set_disconnect_handler(dbus, dbus_disconnected, NULL, NULL);
+	dbus_init(dbus);
+#else
 	l_genl_request_family(genl, NL80211_GENL_NAME, nl80211_appeared,
 				NULL, NULL);
+#endif
 
 	exit_status = l_main_run_with_signal(signal_handler, NULL);
+
 	plugin_exit();
 	iwd_modules_exit();
 
-	storage_cleanup_dirs();
-fail:
+#ifdef HAVE_DBUS
+	dbus_exit();
+	l_dbus_destroy(dbus);
+#endif
+failed_dbus:
+	l_netlink_destroy(rtnl);
+
+failed_rtnl:
 	l_genl_unref(genl);
-fail_genl:
+
+failed_genl:
+	storage_cleanup_dirs();
+
+failed_dirs:
 	l_settings_free(iwd_config);
-
 	l_timeout_remove(timeout);
-
 	l_main_exit();
 
 	return exit_status;

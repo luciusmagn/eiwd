@@ -201,6 +201,23 @@ void *ie_tlv_extract_p2p_payload(const unsigned char *ies, size_t len,
 }
 
 /*
+ * Wi-Fi Display Technical Specification v2.1.0, Section 5.1.1:
+ * "More than one WFD IE may be included in a single frame.  If multiple WFD
+ * IEs are present, the complete WFD subelement data consists of the
+ * concatenation of the WFD subelement fields of the WFD IEs.  The WFD
+ * subelements field of each WFD IE may be any length up to the maximum
+ * (251 octets).  The order of the concatenated WFD subelement data shall be
+ * preserved in the ordering of the WFD IEs in the frame.  All of the WFD IEs
+ * shall fit within a single frame and shall be adjacent in the frame."
+ */
+void *ie_tlv_extract_wfd_payload(const unsigned char *ies, size_t len,
+							ssize_t *out_len)
+{
+	return ie_tlv_vendor_ie_concat(wifi_alliance_oui, 0x0a,
+					ies, len, true, out_len);
+}
+
+/*
  * Encapsulate & Fragment data into Vendor IE with a given OUI + type
  *
  * Returns a newly allocated buffer with the contents of encapsulated into
@@ -898,10 +915,12 @@ static bool ie_build_cipher_suite(uint8_t *data, const uint8_t *oui,
 	return false;
 }
 
-#define RETURN_AKM(data, oui, id)	\
-	memcpy((data), (oui), 3);	\
-	(data)[3] = (id);		\
-	return true;
+#define RETURN_AKM(data, oui, id)		\
+	do {					\
+		memcpy((data), (oui), 3);	\
+		(data)[3] = (id);		\
+		return true;			\
+	} while(0)
 
 /* 802.11-2016, Section 9.4.2.25.3 */
 static bool ie_build_rsn_akm_suite(uint8_t *data, enum ie_rsn_akm_suite suite)
@@ -1585,7 +1604,7 @@ int ie_parse_bss_load_from_data(const uint8_t *data, uint8_t len,
 }
 
 /*
- * We have to store this mapping since basic rates dont come with a convenient
+ * We have to store this mapping since basic rates don't come with a convenient
  * MCS index. Rates are stored as they are encoded in the Supported Rates IE.
  * This does not include non 802.11g data rates, e.g. 1/2/4Mbps. This data was
  * taken from 802.11 Section 17.3.10.2 and Table 10-7.
@@ -1994,7 +2013,7 @@ static int ie_parse_vht_capability(struct ie_tlv_iter *vht_iter,
 	 * combinations (width, MCS, NSS), saving the highest data rate we find.
 	 *
 	 * We could calculate a maximum data rate separately for TX/RX, but
-	 * since this is only used for BSS ranking, the minumum between the
+	 * since this is only used for BSS ranking, the minimum between the
 	 * two should be good enough.
 	 */
 	for (width = sizeof(vht_width_map[0]) - 1; width >= 0; width--) {

@@ -408,7 +408,7 @@ static bool start_qemu(void)
 			"mac80211_hwsim.radios=0 init=%s TESTHOME=%s "
 			"TESTVERBOUT=\'%s\' DEBUG_FILTER=\'%s\'"
 			"TEST_ACTION=%u TEST_ACTION_PARAMS=\'%s\' "
-			"TESTARGS=\'%s\' PATH=\'%s\' VALGRIND=%u"
+			"TESTARGS=\'%s\' PATH=\'%s\' VALGRIND=%u "
 			"GDB=\'%s\' HW=\'%s\' SHELL=%u "
 			"LOG_PATH=\'%s\' LOG_UID=\'%d\' LOG_GID=\'%d\'",
 			check_verbosity("kernel") ? "ignore_loglevel" : "quiet",
@@ -989,7 +989,7 @@ static void stop_ofono(pid_t pid)
 }
 
 static pid_t start_hostapd(char **config_files, struct wiphy **wiphys,
-				const char *test_name)
+				const char *test_name, const char *radius_conf)
 {
 	char **argv;
 	pid_t pid;
@@ -1028,6 +1028,9 @@ static pid_t start_hostapd(char **config_files, struct wiphy **wiphys,
 
 		argv[idx++] = config_files[i];
 	}
+
+	if (radius_conf)
+		argv[idx++] = (void *)radius_conf;
 
 	if (verbose) {
 		argv[idx++] = "-d";
@@ -1358,6 +1361,7 @@ static bool configure_hostapd_instances(struct l_settings *hw_settings,
 	int i;
 	char **hostapd_config_file_paths;
 	struct wiphy **wiphys;
+	const char *radius_config = NULL;
 
 	*phys_used = 0;
 
@@ -1373,7 +1377,7 @@ static bool configure_hostapd_instances(struct l_settings *hw_settings,
 
 	hostapd_config_file_paths = l_new(char *, i + 1);
 	wiphys = alloca(sizeof(struct wiphy *) * (i + 1));
-	wiphys[i] = NULL;
+	memset(wiphys, 0, sizeof(struct wiphy *) * (i + 1));
 
 	hostapd_pids_out[0] = -1;
 
@@ -1396,6 +1400,13 @@ static bool configure_hostapd_instances(struct l_settings *hw_settings,
 				"does not exist.", HW_CONFIG_FILE_NAME,
 						hostapd_config_file_paths[i]);
 			goto done;
+		}
+
+		if (!strcmp(hostap_keys[i], "radius_server")) {
+			radius_config = l_settings_get_value(hw_settings,
+						HW_CONFIG_GROUP_HOSTAPD,
+						"radius_server");
+			continue;
 		}
 
 		for (wiphy_entry = l_queue_get_entries(wiphy_list);
@@ -1475,7 +1486,8 @@ hostapd_done:
 	}
 
 	hostapd_pids_out[0] = start_hostapd(hostapd_config_file_paths, wiphys,
-						basename(config_dir_path));
+						basename(config_dir_path),
+						radius_config);
 	hostapd_pids_out[1] = -1;
 
 done:
@@ -1594,14 +1606,24 @@ static void terminate_iwd(pid_t iwd_pid)
 
 static pid_t start_monitor(const char *test_name)
 {
-	char *argv[4];
+	char *argv[6];
+	char *write_arg;
+	pid_t pid;
+
+	write_arg = l_strdup_printf("%s/%s/monitor.pcap", log_dir, test_name);
 
 	argv[0] = "iwmon";
 	argv[1] = "--nortnl";
 	argv[2] = "--nowiphy";
-	argv[3] = NULL;
+	argv[3] = "--write";
+	argv[4] = write_arg;
+	argv[5] = NULL;
 
-	return execute_program(argv, environ, false, test_name);
+	pid = execute_program(argv, environ, false, test_name);
+
+	l_free(write_arg);
+
+	return pid;
 }
 
 static bool create_tmpfs_extra_stuff(char **tmpfs_extra_stuff)
@@ -1823,6 +1845,7 @@ static void run_py_tests(struct l_settings *hw_settings,
 	unsigned int max_exec_interval;
 	char *py_test = NULL;
 	struct test_stats *test_stats;
+	pid_t monitor_pid = -1;
 
 	if (!l_settings_get_uint(hw_settings, HW_CONFIG_GROUP_SETUP,
 						HW_CONFIG_SETUP_MAX_EXEC_SEC,
@@ -1840,6 +1863,28 @@ start_next_test:
 	py_test = (char *) l_queue_pop_head(test_queue);
 	if (!py_test)
 		return;
+
+	if (log) {
+		char *test_path;
+		char *ext;
+		char *full_path;
+
+		test_path = l_strdup_printf("%s/%s", test_name, py_test);
+		ext = strchr(test_path, '.');
+		ext[0] = '\0';
+
+		full_path = l_strdup_printf("%s/%s", log_dir, test_path);
+
+		mkdir(full_path, 0755);
+		if (chown(full_path, log_uid, log_gid) < 0)
+			l_error("chown failed %s", full_path);
+
+		l_free(full_path);
+
+		monitor_pid = start_monitor(test_path);
+
+		l_free(test_path);
+	}
 
 	argv[0] = "python3";
 	argv[1] = py_test;
@@ -1903,6 +1948,11 @@ start_next_test:
 
 	l_free(py_test);
 	py_test = NULL;
+
+	if (monitor_pid != -1) {
+		kill_process(monitor_pid);
+		monitor_pid = -1;
+	}
 
 	goto start_next_test;
 }
@@ -2016,7 +2066,6 @@ static void create_network_and_run_tests(void *data, void *user_data)
 	pid_t medium_pid = -1;
 	pid_t ofono_pid = -1;
 	pid_t phonesim_pid = -1;
-	pid_t monitor_pid = -1;
 	char *config_dir_path;
 	char *iwd_config_dir;
 	char **tmpfs_extra_stuff = NULL;
@@ -2070,7 +2119,7 @@ static void create_network_and_run_tests(void *data, void *user_data)
 	if (chdir(config_dir_path) < 0) {
 		l_error("Failed to change to test directory: %s",
 							strerror(errno));
-		goto exit_hwsim;
+		goto free_hw_settings;
 	}
 
 	tmpfs_extra_stuff =
@@ -2094,7 +2143,7 @@ static void create_network_and_run_tests(void *data, void *user_data)
 
 			if (!ofono_found || !phonesim_found) {
 				l_info("ofono or phonesim not found, skipping");
-				goto exit_hwsim;
+				goto free_tmpfs_extra;
 			}
 
 			ofono_req = true;
@@ -2162,9 +2211,6 @@ static void create_network_and_run_tests(void *data, void *user_data)
 		l_queue_foreach(wiphy_list, wiphy_up, NULL);
 	}
 
-	if (log)
-		monitor_pid = start_monitor(test_name);
-
 	if (check_verbosity("tls"))
 		setenv("IWD_TLS_DEBUG", "on", true);
 
@@ -2191,7 +2237,7 @@ static void create_network_and_run_tests(void *data, void *user_data)
 						HW_CONFIG_GROUP_SETUP,
 						HW_CONFIG_SETUP_IWD_CONF_DIR);
 		if (!iwd_config_dir)
-			iwd_config_dir = DAEMON_CONFIGDIR;
+			iwd_config_dir = "/tmp";
 
 		iwd_pid = start_iwd(iwd_config_dir, wiphy_list,
 				iwd_ext_options, iwd_phys, test_name);
@@ -2253,9 +2299,6 @@ static void create_network_and_run_tests(void *data, void *user_data)
 		stop_phonesim(phonesim_pid);
 	}
 
-	if (monitor_pid > 0)
-		kill_process(monitor_pid);
-
 exit_hostapd:
 	destroy_hostapd_instances(hostapd_pids);
 
@@ -2265,7 +2308,6 @@ exit_hostapd:
 remove_abs_paths:
 	remove_absolute_path_dirs(tmpfs_extra_stuff);
 
-exit_hwsim:
 	/*
 	 * If running in hwsim mode, we want to completely free/destroy the
 	 * wiphy list since it will be re-populated on the next test. For the
@@ -2277,8 +2319,10 @@ exit_hwsim:
 	else
 		l_queue_foreach(wiphy_list, wiphy_reset, NULL);
 
-	l_settings_free(hw_settings);
+free_tmpfs_extra:
 	l_strfreev(tmpfs_extra_stuff);
+free_hw_settings:
+	l_settings_free(hw_settings);
 }
 
 struct stat_totals {
@@ -3080,6 +3124,8 @@ int main(int argc, char *argv[])
 	uint8_t actions = 0;
 	struct tm *timeinfo;
 	time_t t;
+	char *gid;
+	char *uid;
 
 	l_log_set_stderr();
 
@@ -3101,7 +3147,7 @@ int main(int argc, char *argv[])
 	for (;;) {
 		int opt;
 
-		opt = getopt_long(argc, argv, "A:q:k:v:g:l:UVdh", main_options,
+		opt = getopt_long(argc, argv, "A:q:k:v:g:sl:UVdh", main_options,
 									NULL);
 		if (opt < 0)
 			break;
@@ -3180,8 +3226,16 @@ int main(int argc, char *argv[])
 			time(&t);
 			timeinfo = localtime(&t);
 
-			log_gid = atoi(getenv("SUDO_GID"));
-			log_uid = atoi(getenv("SUDO_UID"));
+			gid = getenv("SUDO_GID");
+			uid = getenv("SUDO_UID");
+
+			if (!gid || !uid) {
+				log_gid = getgid();
+				log_uid = getuid();
+			} else {
+				log_gid = strtol(gid, NULL, 10);
+				log_uid = strtol(uid, NULL, 10);
+			}
 
 			snprintf(log_dir, sizeof(log_dir), "%s/run-%d-%d-%d-%d",
 					optarg, timeinfo->tm_year + 1900,

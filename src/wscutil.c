@@ -31,6 +31,8 @@
 
 #include <ell/ell.h>
 
+#include "src/util.h"
+#include "src/ie.h"
 #include "src/wscutil.h"
 
 const unsigned char wsc_wfa_oui[3] = { 0x00, 0x37, 0x2a };
@@ -1759,11 +1761,24 @@ static uint8_t *wsc_attr_builder_free(struct wsc_attr_builder *builder,
 	return ret;
 }
 
+static void build_ap_setup_locked(struct wsc_attr_builder *builder, bool locked)
+{
+	wsc_attr_builder_start_attr(builder, WSC_ATTR_AP_SETUP_LOCKED);
+	wsc_attr_builder_put_u8(builder, locked ? 0x01 : 0x00);
+}
+
 static void build_association_state(struct wsc_attr_builder *builder,
 					enum wsc_association_state state)
 {
 	wsc_attr_builder_start_attr(builder, WSC_ATTR_ASSOCIATION_STATE);
 	wsc_attr_builder_put_u16(builder, state);
+}
+
+static void build_authentication_type(struct wsc_attr_builder *builder,
+							uint16_t auth_type)
+{
+	wsc_attr_builder_start_attr(builder, WSC_ATTR_AUTHENTICATION_TYPE);
+	wsc_attr_builder_put_u16(builder, auth_type);
 }
 
 static void build_authentication_type_flags(struct wsc_attr_builder *builder,
@@ -1814,6 +1829,13 @@ static void build_device_password_id(struct wsc_attr_builder *builder,
 {
 	wsc_attr_builder_start_attr(builder, WSC_ATTR_DEVICE_PASSWORD_ID);
 	wsc_attr_builder_put_u16(builder, id);
+}
+
+static void build_encryption_type(struct wsc_attr_builder *builder,
+						uint16_t encryption_type)
+{
+	wsc_attr_builder_start_attr(builder, WSC_ATTR_ENCRYPTION_TYPE);
+	wsc_attr_builder_put_u16(builder, encryption_type);
 }
 
 static void build_encryption_type_flags(struct wsc_attr_builder *builder,
@@ -1900,6 +1922,27 @@ static void build_model_number(struct wsc_attr_builder *builder,
 	wsc_attr_builder_put_string(builder, model_number);
 }
 
+static void build_network_index(struct wsc_attr_builder *builder,
+							uint8_t network_index)
+{
+	wsc_attr_builder_start_attr(builder, WSC_ATTR_NETWORK_INDEX);
+	wsc_attr_builder_put_u8(builder, network_index);
+}
+
+static void build_network_key(struct wsc_attr_builder *builder,
+					const uint8_t *key, size_t key_len)
+{
+	wsc_attr_builder_start_attr(builder, WSC_ATTR_NETWORK_KEY);
+	wsc_attr_builder_put_bytes(builder, key, key_len);
+}
+
+static void build_new_password(struct wsc_attr_builder *builder,
+				const uint8_t *password, size_t password_len)
+{
+	wsc_attr_builder_start_attr(builder, WSC_ATTR_NEW_PASSWORD);
+	wsc_attr_builder_put_bytes(builder, password, password_len);
+}
+
 static void build_os_version(struct wsc_attr_builder *builder,
 							uint32_t os_version)
 {
@@ -1979,6 +2022,29 @@ static void build_r_snonce2(struct wsc_attr_builder *builder,
 	wsc_attr_builder_put_bytes(builder, nonce, 16);
 }
 
+static void build_selected_registrar(struct wsc_attr_builder *builder,
+							bool selected)
+{
+	wsc_attr_builder_start_attr(builder, WSC_ATTR_SELECTED_REGISTRAR);
+	wsc_attr_builder_put_u8(builder, selected ? 0x01 : 0x00);
+}
+
+static void build_selected_registrar_configuration_methods(
+					struct wsc_attr_builder *builder,
+					uint16_t config_methods)
+{
+	wsc_attr_builder_start_attr(builder,
+			WSC_ATTR_SELECTED_REGISTRAR_CONFIGURATION_METHODS);
+	wsc_attr_builder_put_u16(builder, config_methods);
+}
+
+static void build_ssid(struct wsc_attr_builder *builder, const uint8_t *ssid,
+							size_t ssid_len)
+{
+	wsc_attr_builder_start_attr(builder, WSC_ATTR_SSID);
+	wsc_attr_builder_put_bytes(builder, ssid, ssid_len);
+}
+
 static void build_serial_number(struct wsc_attr_builder *builder,
 						const char *serial_number)
 {
@@ -2018,6 +2084,36 @@ static void build_wsc_state(struct wsc_attr_builder *builder,
 	wsc_attr_builder_put_u8(builder, 1);				\
 	wsc_attr_builder_put_u8(builder, 0x20)
 
+uint8_t *wsc_build_credential(const struct wsc_credential *in, size_t *out_len)
+{
+	struct wsc_attr_builder *builder;
+	uint8_t *ret;
+
+	builder = wsc_attr_builder_new(128);
+	build_network_index(builder, 1);
+	build_ssid(builder, in->ssid, in->ssid_len);
+	build_authentication_type(builder, in->auth_type);
+	build_encryption_type(builder, in->encryption_type);
+	build_network_key(builder, in->network_key, in->network_key_len);
+	build_mac_address(builder, in->addr);
+
+	/* TODO: Append EAP attrs & Network Key Shareable inside WFA EXT */
+
+	ret = wsc_attr_builder_free(builder, false, out_len);
+	return ret;
+}
+
+static void build_credential(struct wsc_attr_builder *builder,
+					const struct wsc_credential *cred)
+{
+	size_t data_len;
+	uint8_t *data = wsc_build_credential(cred, &data_len);
+
+	wsc_attr_builder_start_attr(builder, WSC_ATTR_CREDENTIAL);
+	wsc_attr_builder_put_bytes(builder, data, data_len);
+	l_free(data);
+}
+
 uint8_t *wsc_build_probe_request(const struct wsc_probe_request *probe_request,
 							size_t *out_len)
 {
@@ -2051,6 +2147,76 @@ uint8_t *wsc_build_probe_request(const struct wsc_probe_request *probe_request,
 	wsc_attr_builder_put_u8(builder, WSC_WFA_EXTENSION_REQUEST_TO_ENROLL);
 	wsc_attr_builder_put_u8(builder, 1);
 	wsc_attr_builder_put_u8(builder, 1);
+
+done:
+	ret = wsc_attr_builder_free(builder, false, out_len);
+	return ret;
+}
+
+uint8_t *wsc_build_probe_response(
+		const struct wsc_probe_response *probe_response,
+		size_t *out_len)
+{
+	struct wsc_attr_builder *builder;
+	uint8_t *ret;
+
+	builder = wsc_attr_builder_new(512);
+	build_version(builder, 0x10);
+	build_wsc_state(builder, probe_response->state);
+
+	if (probe_response->ap_setup_locked)
+		build_ap_setup_locked(builder, true);
+
+	if (probe_response->selected_registrar) {
+		build_selected_registrar(builder, true);
+		build_device_password_id(builder,
+				probe_response->device_password_id);
+		build_selected_registrar_configuration_methods(builder,
+				probe_response->selected_reg_config_methods);
+	}
+
+	build_response_type(builder, probe_response->response_type);
+	build_uuid_e(builder, probe_response->uuid_e);
+	build_manufacturer(builder, probe_response->manufacturer);
+	build_model_name(builder, probe_response->model_name);
+	build_model_number(builder, probe_response->model_number);
+	build_serial_number(builder, probe_response->serial_number);
+	build_primary_device_type(builder,
+					&probe_response->primary_device_type);
+	build_device_name(builder, probe_response->device_name);
+	build_configuration_methods(builder, probe_response->config_methods);
+
+	if (probe_response->rf_bands & (probe_response->rf_bands - 1))
+		build_rf_bands(builder, probe_response->rf_bands);
+
+	if (!probe_response->version2)
+		goto done;
+
+	START_WFA_VENDOR_EXTENSION();
+
+	if (!util_mem_is_zero(probe_response->authorized_macs, 30)) {
+		int count;
+
+		for (count = 1; count < 5; count++)
+			if (util_mem_is_zero(probe_response->authorized_macs +
+						count * 6, 30 - count * 6))
+				break;
+
+		wsc_attr_builder_put_u8(builder,
+					WSC_WFA_EXTENSION_AUTHORIZED_MACS);
+		wsc_attr_builder_put_u8(builder, count * 6);
+		wsc_attr_builder_put_bytes(builder,
+					probe_response->authorized_macs,
+					count * 6);
+	}
+
+	if (probe_response->reg_config_methods) {
+		wsc_attr_builder_put_u8(builder,
+			WSC_WFA_EXTENSION_REGISTRAR_CONFIGRATION_METHODS);
+		wsc_attr_builder_put_u8(builder, 2);
+		wsc_attr_builder_put_u16(builder,
+					probe_response->reg_config_methods);
+	}
 
 done:
 	ret = wsc_attr_builder_free(builder, false, out_len);
@@ -2393,6 +2559,30 @@ done:
 	return ret;
 }
 
+uint8_t *wsc_build_m8_encrypted_settings(
+				const struct wsc_m8_encrypted_settings *in,
+				const struct wsc_credential *creds,
+				unsigned int creds_cnt, size_t *out_len)
+{
+	struct wsc_attr_builder *builder;
+	unsigned int i;
+
+	builder = wsc_attr_builder_new(256);
+
+	for (i = 0; i < creds_cnt; i++)
+		build_credential(builder, &creds[i]);
+
+	if (in->new_password_len) {
+		build_new_password(builder, in->new_password,
+					in->new_password_len);
+		build_device_password_id(builder, in->device_password_id);
+	}
+
+	build_key_wrap_authenticator(builder, in->authenticator);
+
+	return wsc_attr_builder_free(builder, false, out_len);
+}
+
 uint8_t *wsc_build_wsc_ack(const struct wsc_ack *ack, size_t *out_len)
 {
 	struct wsc_attr_builder *builder;
@@ -2601,4 +2791,203 @@ bool wsc_pin_generate(char *pin)
 	pin[8] = '\0';
 
 	return true;
+}
+
+struct device_type_category_info {
+	const char *category_str;
+	unsigned int subcategory_max;
+	const char **subcategory_str;
+};
+
+/* WSC 2.0.5, Table 41 strings adapted to IWD DBus enum convention */
+struct device_type_category_info device_type_categories[] = {
+	[1] = {
+		"computer",
+		10,
+		(const char *[]) {
+			[1] = "pc",
+			[2] = "server",
+			[3] = "media-center",
+			[4] = "ultra-mobile-pc",
+			[5] = "notebook",
+			[6] = "desktop",
+			[7] = "mobile-internet-device",
+			[8] = "netbook",
+			[9] = "tablet",
+			[10] = "ultrabook",
+		},
+	},
+	[2] = {
+		"input-device",
+		9,
+		(const char *[]) {
+			[1] = "keyboard",
+			[2] = "mouse",
+			[3] = "joystick",
+			[4] = "trackball",
+			[5] = "gaming-controller",
+			[6] = "remote",
+			[7] = "touchscreen",
+			[8] = "biometric-reader",
+			[9] = "barcode-reader",
+		},
+	},
+	[3] = {
+		"printer-scanner",
+		5,
+		(const char *[]) {
+			[1] = "printer-print-server",
+			[2] = "scanner",
+			[3] = "fax",
+			[4] = "copier",
+			[5] = "printer-scanner-fax-copier",
+		},
+	},
+	[4] = {
+		"camera",
+		4,
+		(const char *[]) {
+			[1] = "digital-still-camera",
+			[2] = "video-camera",
+			[3] = "web-camera",
+			[4] = "security-camera",
+		},
+	},
+	[5] = {
+		"storage",
+		1,
+		(const char *[]) {
+			[1] = "nas",
+		},
+	},
+	[6] = {
+		"network-infrastructure",
+		5,
+		(const char *[]) {
+			[1] = "ap",
+			[2] = "router",
+			[3] = "switch",
+			[4] = "gateway",
+			[5] = "bridge",
+		},
+	},
+	[7] = {
+		"display",
+		4,
+		(const char *[]) {
+			[1] = "television",
+			[2] = "electronic-picture-frame",
+			[3] = "projector",
+			[4] = "monitor",
+		},
+	},
+	[8] = {
+		"multimedia-device",
+		6,
+		(const char *[]) {
+			[1] = "dar",
+			[2] = "pvr",
+			[3] = "mcx",
+			[4] = "set-top-box",
+			[5] = "media-server-adapter-extender",
+			[6] = "portable-video-player",
+		},
+	},
+	[9] = {
+		"gaming-device",
+		5,
+		(const char *[]) {
+			[1] = "xbox",
+			[2] = "xbox360",
+			[3] = "playstation",
+			[4] = "game-console-adapter",
+			[5] = "portable-gaming-device",
+		},
+	},
+	[10] = {
+		"telephone",
+		5,
+		(const char *[]) {
+			[1] = "windows-mobile",
+			[2] = "single-mode-phone",
+			[3] = "dual-mode-phone",
+			[4] = "single-mode-smartphone",
+			[5] = "dual-mode-smartphone",
+		},
+	},
+	[11] = {
+		"audio-device",
+		7,
+		(const char *[]) {
+			[1] = "audio-tuner-receiver",
+			[2] = "speakers",
+			[3] = "portable-music-player",
+			[4] = "headset",
+			[5] = "headphones",
+			[6] = "microphone",
+			[7] = "home-theater-system",
+		},
+	},
+	[12] = {
+		"docking-device",
+		2,
+		(const char *[]) {
+			[1] = "computer-docking-station",
+			[2] = "media-kiosk",
+		},
+	},
+};
+
+bool wsc_device_type_to_dbus_str(const struct wsc_primary_device_type *val,
+					const char **category_str,
+					const char **subcategory_str)
+{
+	struct device_type_category_info *cat;
+
+	if (val->category >= L_ARRAY_SIZE(device_type_categories))
+		return false;
+
+	cat = &device_type_categories[val->category];
+
+	if (!cat->category_str)
+		return false;
+
+	if (category_str)
+		*category_str = cat->category_str;
+
+	if (!subcategory_str)
+		return true;
+
+	if (memcmp(val->oui, microsoft_oui, 3) || val->oui_type != 4)
+		*subcategory_str = NULL;	/* Vendor-specific */
+	else if (val->subcategory <= cat->subcategory_max &&
+			cat->subcategory_str[val->subcategory])
+		*subcategory_str = cat->subcategory_str[val->subcategory];
+	else
+		*subcategory_str = NULL;	/* Unknown */
+
+	return true;
+}
+
+bool wsc_device_type_from_subcategory_str(struct wsc_primary_device_type *out,
+						const char *subcategory_str)
+{
+	struct device_type_category_info *cat = device_type_categories;
+	unsigned int i;
+
+	for (i = 1; i < L_ARRAY_SIZE(device_type_categories); i++, cat++) {
+		unsigned int j;
+
+		for (j = 1; j <= cat->subcategory_max; j++)
+			if (!strcasecmp(subcategory_str,
+					cat->subcategory_str[j])) {
+				out->category = i;
+				memcpy(out->oui, microsoft_oui, 3);
+				out->oui_type = 4;
+				out->subcategory = j;
+				return true;
+			}
+	}
+
+	return false;
 }

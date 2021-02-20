@@ -109,6 +109,21 @@ The group ``[Settings]`` contains general settings.
 
        Whether the network is hidden, i.e. its SSID must be included in an
        active scan request
+   * - AlwaysRandomizeAddress
+     - Values: true, **false**
+
+       If enabled, the MAC address will be fully randomized on each connection.
+       This option is only used if [General].AddressRandomization is set to
+       'network'. See iwd.config. This value should not be used with
+       [Settings].AddressOverride, if both are set AddressOverride will be used.
+   * - AddressOverride
+     - MAC address string
+
+       Override the MAC address used for connecting to this network. This option
+       is only used if [General].AddressRandomization is set to 'network'. See
+       iwd.config. This value should not be used with
+       [Settings].FullAddressRandomization, if both are set AddressOverride will
+       be used.
 
 Network Authentication Settings
 -------------------------------
@@ -231,6 +246,51 @@ authentication configuration.
        in the setting keys and their usage is unchanged. Since the inner
        method's negotiation is encrypted, a secure identity string can be
        provided.
+
+Network Configuration Settings
+-------------------------------
+
+The group ``[IPv4]`` contains settings for Internet Protocol version 4 (IPv4)
+network configuration with the static addresses.
+
+.. list-table::
+   :header-rows: 0
+   :stub-columns: 0
+   :widths: 20 80
+   :align: left
+
+   * - Address
+     - IPv4 address string
+
+       The IPv4 address to assign. This field is `required` for the static
+       configuration.
+   * - Gateway
+     - IPv4 address string
+
+       The IPv4 address of the gateway (router). This field is `required` for
+       the static configuration.
+   * - DNS
+     - IPv4 address string
+
+       The IPv4 address of the Domain Name System (DNS). This field is
+       `optional`. DNS setting can be used to override the DNS entries received
+       from the DHCP server.
+   * - Netmask
+     - IPv4 address string
+
+       The IPv4 address of the subnet. This field is `optional`. 255.255.255.0
+       is used as default Netmask.
+   * - Broadcast
+     - IPv4 address string
+
+       The IPv4 address to be used for the broadcast. This field is `optional`.
+   * - DomainName
+     - string
+
+       The DomainName is the name of the local Internet domain. This field is
+       `optional`. DomainName setting can be used to override the DomainName
+       value obtained from the DHCP server.
+
 
 Embedded PEMs
 -------------

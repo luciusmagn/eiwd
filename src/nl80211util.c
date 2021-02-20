@@ -63,6 +63,30 @@ static bool extract_name(const void *data, uint16_t len, void *o)
 	return true;
 }
 
+static bool extract_2_chars(const void *data, uint16_t len, void *o)
+{
+	char *out = o;
+	const char *in = data;
+
+	if (len != 3 || in[2] != 0)
+		return false;
+
+	out[0] = in[0];
+	out[1] = in[1];
+	return true;
+}
+
+static bool extract_mac(const void *data, uint16_t len, void *o)
+{
+	const uint8_t **out = o;
+
+	if (len != 6)
+		return false;
+
+	*out = data;
+	return true;
+}
+
 static bool extract_uint64(const void *data, uint16_t len, void *o)
 {
 	uint64_t *out = o;
@@ -85,6 +109,14 @@ static bool extract_uint32(const void *data, uint16_t len, void *o)
 	return true;
 }
 
+static bool extract_flag(const void *data, uint16_t len, void *o)
+{
+	if (len != 0)
+		return false;
+
+	return true;
+}
+
 static attr_handler handler_for_type(enum nl80211_attrs type)
 {
 	switch (type) {
@@ -99,6 +131,12 @@ static attr_handler handler_for_type(enum nl80211_attrs type)
 	case NL80211_ATTR_IFNAME:
 	case NL80211_ATTR_WIPHY_NAME:
 		return extract_name;
+	case NL80211_ATTR_REG_ALPHA2:
+		return extract_2_chars;
+	case NL80211_ATTR_MAC:
+		return extract_mac;
+	case NL80211_ATTR_ACK:
+		return extract_flag;
 	default:
 		break;
 	}
@@ -176,6 +214,11 @@ int nl80211_parse_attrs(struct l_genl_msg *msg, int tag, ...)
 
 	for (e = l_queue_get_entries(entries); e; e = e->next) {
 		entry = e->data;
+
+		if (entry->handler == extract_flag) {
+			*(bool *) entry->data = entry->present;
+			continue;
+		}
 
 		if (entry->present)
 			continue;
